@@ -495,6 +495,136 @@ def test_lane_uniform_int_cast_numeric(npu):
 
 
 @pytest.mark.pto
+def _sub_1d(n, lanes):
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), B: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            b_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    c_ub[i] = a_ub[i] - b_ub[i] - 1.0
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("lanes", [64, 128])
+def test_sub_1d_multichunk(npu, lanes):
+    _require_npu_runtime()
+    n = 300
+    a = torch.randn(n, device=npu)
+    b = torch.randn(n, device=npu)
+    kernel = tilelang.compile(_sub_1d(n, lanes), target="pto", out_idx=-1)
+    out = kernel(a, b)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out, a - b - 1.0, rtol=1e-5, atol=1e-5)
+
+
+def _div_1d(n, lanes, dtype):
+    @T.prim_func
+    def main(A: T.Tensor((n,), dtype), B: T.Tensor((n,), dtype), C: T.Tensor((n,), dtype)):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), dtype)
+            b_ub = T.alloc_shared((n,), dtype)
+            c_ub = T.alloc_shared((n,), dtype)
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    c_ub[i] = a_ub[i] / (b_ub[i] + T.cast(2, dtype))
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_div_f32_1d(npu):
+    _require_npu_runtime()
+    n = 256
+    a = torch.randn(n, device=npu)
+    b = torch.randn(n, device=npu)
+    kernel = tilelang.compile(_div_1d(n, 128, "float32"), target="pto", out_idx=-1)
+    out = kernel(a, b)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out, a / (b + 2.0), rtol=1e-4, atol=1e-4)
+
+
+def _unary_1d(n, lanes, kind):
+
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    if kind == 0:
+                        c_ub[i] = T.abs(a_ub[i] - 0.5)
+                    elif kind == 1:
+                        c_ub[i] = T.exp(a_ub[i])
+                    elif kind == 2:
+                        c_ub[i] = T.log(T.abs(a_ub[i]) + 1.0)
+                    else:
+                        c_ub[i] = T.sqrt(T.abs(a_ub[i]) + 0.25)
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("kind", [0, 1, 2, 3])
+def test_unary_1d(npu, kind):
+    _require_npu_runtime()
+    n = 256
+    a = torch.randn(n, device=npu)
+    kernel = tilelang.compile(_unary_1d(n, 128, kind), target="pto", out_idx=-1)
+    out = kernel(a)
+    torch.npu.synchronize()
+    if kind == 0:
+        ref = (a - 0.5).abs()
+    elif kind == 1:
+        ref = a.exp()
+    elif kind == 2:
+        ref = (a.abs() + 1.0).log()
+    else:
+        ref = (a.abs() + 0.25).sqrt()
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+
+def _f32_narrow(n, lanes, to_dtype):
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), to_dtype)):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), to_dtype)
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    c_ub[i] = T.cast(a_ub[i] * 0.5 - 0.25, to_dtype)
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("to_dtype", ["float16", "bfloat16"])
+def test_f32_to_fp16_bf16_narrow(npu, to_dtype):
+    _require_npu_runtime()
+    n = 256
+    a = torch.randn(n, device=npu) * 4.0
+    kernel = tilelang.compile(_f32_narrow(n, 128, to_dtype), target="pto", out_idx=-1)
+    out = kernel(a)
+    torch.npu.synchronize()
+    ref = (a * 0.5 - 0.25).to(getattr(torch, to_dtype))
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-3, atol=1e-3)
+
+
 def test_pipeline_routes_to_new_passes(npu):
     """Pass-instrument check: the pto pipeline must run Verify/Vectorize and
     must NOT run AscendSimdVFLowerParallel; auto-schedule must inject sync."""
@@ -519,3 +649,266 @@ if __name__ == "__main__":
     import tilelang.testing
 
     tilelang.testing.main()
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: dtype-matrix positives and tail coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.pto
+def test_div_f16_1d(npu):
+    _require_npu_runtime()
+    n = 256
+    a = torch.randn(n, device=npu).half()
+    b = (torch.randn(n, device=npu) + 2.5).half()
+    kernel = tilelang.compile(_div_1d(n, 128, "float16"), target="pto", out_idx=-1)
+    out = kernel(a, b)
+    torch.npu.synchronize()
+    # The device adds the constant in f16: the denominator rounds to f16
+    # *before* the division. Mirror that in the reference.
+    denominator = (b.float() + 2.0).half()
+    ref = (a.float() / denominator.float()).half()
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.pto
+def test_sub_bf16_1d(npu):
+    _require_npu_runtime()
+    n = 256
+    a = torch.randn(n, device=npu).bfloat16()
+    b = torch.randn(n, device=npu).bfloat16()
+    kernel = tilelang.compile(_sub_1d_dtype(n, 128, "bfloat16"), target="pto", out_idx=-1)
+    out = kernel(a, b)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out.float(), (a.float() - b.float()), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.pto
+def test_sub_i32_1d(npu):
+    _require_npu_runtime()
+    n = 256
+    a = torch.randint(-1000, 1000, (n,), device=npu, dtype=torch.int32)
+    b = torch.randint(-1000, 1000, (n,), device=npu, dtype=torch.int32)
+    kernel = tilelang.compile(_sub_1d_dtype(n, 128, "int32"), target="pto", out_idx=-1)
+    out = kernel(a, b)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out, a - b)
+
+
+@pytest.mark.pto
+def test_div_f32_tail(npu):
+    _require_npu_runtime()
+    n = 300
+    a = torch.randn(n, device=npu)
+    b = torch.randn(n, device=npu)
+    kernel = tilelang.compile(_div_1d(n, 128, "float32"), target="pto", out_idx=-1)
+    out = kernel(a, b)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out, a / (b + 2.0), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.pto
+def test_unary_f32_tail(npu):
+    _require_npu_runtime()
+    n = 300
+    a = torch.randn(n, device=npu)
+    kernel = tilelang.compile(_unary_1d(n, 128, 1), target="pto", out_idx=-1)
+    out = kernel(a)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out, a.exp(), rtol=1e-4, atol=1e-4)
+
+
+def _unary_f16_kernel(n, lanes):
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float16"), C: T.Tensor((n,), "float16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float16")
+            c_ub = T.alloc_shared((n,), "float16")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    c_ub[i] = T.abs(a_ub[i] - T.cast(0.5, "float16"))
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_unary_f16_abs(npu):
+    _require_npu_runtime()
+    n = 256
+    a = torch.randn(n, device=npu).half()
+    kernel = tilelang.compile(_unary_f16_kernel(n, 128), target="pto", out_idx=-1)
+    out = kernel(a)
+    torch.npu.synchronize()
+    ref = (a.float() - 0.5).abs().half()
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-3, atol=1e-3)
+
+
+def _sub_1d_dtype(n, lanes, dtype):
+    @T.prim_func
+    def main(A: T.Tensor((n,), dtype), B: T.Tensor((n,), dtype), C: T.Tensor((n,), dtype)):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), dtype)
+            b_ub = T.alloc_shared((n,), dtype)
+            c_ub = T.alloc_shared((n,), dtype)
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    c_ub[i] = a_ub[i] - b_ub[i]
+            T.copy(c_ub, C)
+
+    return main
+
+
+# ---------------------------------------------------------------------------
+# Review round 2: narrowing-cast attribute/boundary coverage, f16 unary
+# ---------------------------------------------------------------------------
+
+
+def _narrow_kernel(n, lanes, to_dtype):
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), to_dtype)):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), to_dtype)
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    c_ub[i] = T.cast(a_ub[i], to_dtype)
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_narrow_cast_attributes(npu):
+    kernel = tilelang.compile(_narrow_kernel(256, 128, "float16"), target="pto", out_idx=-1)
+    line = [ln.strip() for ln in kernel.get_kernel_source().split("\n") if "vmi.vcvt(" in ln and "=" in ln][0]
+    assert "to_dtype=pto.f16" in line, line
+    assert 'rounding="R"' in line, line
+    assert 'saturate="NOSAT"' in line, line
+
+
+@pytest.mark.pto
+def test_narrow_cast_f16_boundary_values(npu):
+    _require_npu_runtime()
+    # f16: 2^-14 is the smallest normal; 2049/2051 are ties-to-even
+    # midpoints; 65519.99 rounds to 65504 (largest finite) under R; 65520
+    # overflows to +inf under NOSAT.
+    values = [
+        0.0,
+        -0.0,
+        5.960464477539063e-08,  # smallest f16 subnormal (2^-24)
+        6.097555160522461e-05,  # mid-subnormal, nonzero
+        6.103515625e-05,  # 2^-14, smallest f16 normal
+        2049.0,  # tie between 2048 and 2052 -> even (2048)
+        2051.0,  # tie between 2048 and 2052 -> even (2052)
+        65504.0,  # largest finite
+        65519.99,  # rounds to 65504
+        65520.0,  # overflow -> +inf (NOSAT)
+        -65520.0,  # overflow -> -inf (NOSAT)
+    ]
+    n = 256
+    x = torch.zeros(n, dtype=torch.float32)
+    x[: len(values)] = torch.tensor(values, dtype=torch.float32)
+    kernel = tilelang.compile(_narrow_kernel(n, 128, "float16"), target="pto", out_idx=-1)
+    out = kernel(x.to(npu))
+    torch.npu.synchronize()
+    got = out.float()[: len(values)].cpu()
+
+    ref = x[: len(values)].half().float()
+    torch.testing.assert_close(got, ref, rtol=0, atol=0, equal_nan=True)
+    assert got[2] != 0.0 and got[3] != 0.0, "f16 subnormals must not flush to zero"
+    assert got[1] == 0.0 and torch.signbit(got[1]), "negative zero must keep the sign bit"
+    assert torch.isinf(got[9]) and got[9] > 0, "NOSAT f16 overflow must be +inf"
+    assert torch.isinf(got[10]) and got[10] < 0, "NOSAT f16 negative overflow must be -inf"
+
+
+@pytest.mark.pto
+def test_narrow_cast_bf16_boundary_values(npu):
+    _require_npu_runtime()
+    # bf16: 2^-126 is the smallest normal; 7-bit mantissa means ties at
+    # half-ULP of the 128-spaced binade. f32 sources cannot exceed bf16
+    # max finite (~3.39e38 vs f32 max ~3.40e38), so no bf16 overflow case.
+    values = [
+        0.0,
+        -0.0,
+        9.183549615799121e-41,  # smallest bf16 subnormal (2^-133)
+        1.1754943508222875e-38,  # 2^-126, smallest bf16 normal
+        1.9921875,  # tie -> rounds to 2.0 (even)
+        2.0078125,  # tie -> rounds to 2.0 (even)
+        3.3895313892515355e38,  # near bf16 max finite
+    ]
+    n = 256
+    x = torch.zeros(n, dtype=torch.float32)
+    x[: len(values)] = torch.tensor(values, dtype=torch.float32)
+    kernel = tilelang.compile(_narrow_kernel(n, 128, "bfloat16"), target="pto", out_idx=-1)
+    out = kernel(x.to(npu))
+    torch.npu.synchronize()
+    got = out.float()[: len(values)].cpu()
+
+    ref = x[: len(values)].bfloat16().float()
+    torch.testing.assert_close(got, ref, rtol=0, atol=0, equal_nan=True)
+    assert got[2] != 0.0, "bf16 subnormal must not flush to zero"
+    assert got[1] == 0.0 and torch.signbit(got[1]), "negative zero must keep the sign bit"
+
+
+@pytest.mark.pto
+def test_narrow_cast_bf16_attributes(npu):
+    kernel = tilelang.compile(_narrow_kernel(256, 128, "bfloat16"), target="pto", out_idx=-1)
+    line = [ln.strip() for ln in kernel.get_kernel_source().split("\n") if "vmi.vcvt(" in ln and "=" in ln][0]
+    assert "to_dtype=pto.bf16" in line, line
+    assert 'rounding="R"' in line, line
+    assert 'saturate="NOSAT"' in line, line
+
+
+@pytest.mark.pto
+def test_narrow_cast_bf16_tail(npu):
+    _require_npu_runtime()
+    n = 300
+    a = torch.randn(n, device=npu) * 1000
+    kernel = tilelang.compile(_narrow_kernel(n, 128, "bfloat16"), target="pto", out_idx=-1)
+    out = kernel(a)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out.float(), a.bfloat16().float(), rtol=1e-3, atol=1e-3)
+
+
+def _unary_f16_math_kernel(n, lanes, kind):
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float16"), C: T.Tensor((n,), "float16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float16")
+            c_ub = T.alloc_shared((n,), "float16")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    if kind == 0:
+                        c_ub[i] = T.exp(a_ub[i])
+                    elif kind == 1:
+                        c_ub[i] = T.log(T.abs(a_ub[i]) + T.cast(1.0, "float16"))
+                    else:
+                        c_ub[i] = T.sqrt(T.abs(a_ub[i]) + T.cast(0.25, "float16"))
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("kind", [0, 1, 2])
+def test_unary_f16_math(npu, kind):
+    _require_npu_runtime()
+    n = 256
+    a = (torch.randn(n, device=npu) * 2).half()
+    kernel = tilelang.compile(_unary_f16_math_kernel(n, 128, kind), target="pto", out_idx=-1)
+    out = kernel(a)
+    torch.npu.synchronize()
+    if kind == 0:
+        ref = a.exp()
+    elif kind == 1:
+        ref = (a.abs() + 1.0).log()
+    else:
+        ref = (a.abs() + 0.25).sqrt()
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-2, atol=1e-2)

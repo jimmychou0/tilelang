@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
+import re
+
 import pytest
 
 import tilelang.ascend.language as T
@@ -35,6 +37,33 @@ from tilelang.engine.lower import lower as _lower
 import tvm
 
 _REMAINING = "remaining"
+
+
+@contextmanager
+def _verify_boundary_capture():
+    """Capture the module handed to VerifyParallelToPTO, then delegate.
+
+    Self-contained copy of the contract suite's helper so this file runs
+    standalone (cross-test-module imports are fragile under pytest's
+    rootdir-dependent module resolution).
+    """
+    captured = {}
+    original = ascend_transform.VerifyParallelToPTO
+
+    def capturing_factory():
+        verify_pass = original()
+
+        def run(mod):
+            captured["module"] = mod
+            return verify_pass(mod)
+
+        return run
+
+    ascend_transform.VerifyParallelToPTO = capturing_factory
+    try:
+        yield captured
+    finally:
+        ascend_transform.VerifyParallelToPTO = original
 
 
 def _ceil_to_lanes(extent: int, lanes: int) -> int:
@@ -350,3 +379,188 @@ def test_explicit_padding_is_rejected_at_this_stage():
     assert "VerifyParallelToPTO" in message or "conditional" in message or "unsupported" in message, (
         f"expected the guard rejection diagnostic, got: {message}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: sub/div/unary emission and lane-uniform folding
+# ---------------------------------------------------------------------------
+
+
+def _sub_kernel(n, lanes):
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), B: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            b_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    c_ub[i] = a_ub[i] - b_ub[i]
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_vectorize_emits_vsub():
+    source = _lower(_sub_kernel(256, 128), target="pto").kernel_source
+    assert "pto.vmi.vsub(" in source
+
+
+def _int_uniform_fold_kernel(n, lanes):
+    @T.prim_func
+    def main(A: T.Tensor((n,), "int32"), S: T.Tensor((1,), "int32"), C: T.Tensor((n,), "int32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "int32")
+            s_ub = T.alloc_shared((1,), "int32")
+            c_ub = T.alloc_shared((n,), "int32")
+            T.copy(A, a_ub)
+            T.copy(S, s_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    # The scalar bind pins the uniform Sub into its own
+                    # statement (an inline `a - (s-1)` is algebraically
+                    # restructured into `(a+1) - s` by the analyzer). The
+                    # bound value must stay a scalar Sub feeding the
+                    # broadcast, not become a vsub of its own.
+                    d: T.int32 = s_ub[0] - 1
+                    c_ub[i] = a_ub[i] - d
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_vectorize_int_uniform_sub_folds_scalar():
+
+    from tilelang.ascend import transform as atx
+
+    # Run Vectorize directly on the captured post-Verify module and check
+    # the emitted TIR: the inner uniform Sub must remain a scalar SubNode
+    # inside the vbrc operand, not become a tl.vmi.vsub call of its own.
+    with _verify_boundary_capture() as capture:
+        _lower(_int_uniform_fold_kernel(256, 128), target="pto")
+    mod = capture["module"]
+    out = atx.VectorizeParallelToPTO()(mod)
+    script = out["main"].script()
+    assert script.count("tl.vmi.vsub") == 1, "expected exactly one vsub (the varying outer sub)\n" + script
+    scalar_sub = re.search(r"d: T\.int32 = .* - 1", script)
+    assert scalar_sub is not None, "expected the runtime-uniform sub to stay a scalar bind\n" + script
+
+
+def _runtime_uniform_float_kernel(n, lanes):
+    @T.prim_func
+    def main(S: T.Tensor((2,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            s_ub = T.alloc_shared((2,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(S, s_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    # Both operands are runtime lane-uniform floats: this
+                    # stays scalar and must be rejected at Verify.
+                    c_ub[i] = s_ub[0] / s_ub[1]
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_verify_runtime_uniform_float_div_rejected():
+    with pytest.raises(
+        Exception,
+        match=r"runtime lane-uniform float computation.*scalar float ALU",
+    ):
+        _lower(_runtime_uniform_float_kernel(256, 128), target="pto")
+
+
+def _unary_kernel(n, lanes, kind):
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    if kind == 0:
+                        c_ub[i] = T.abs(a_ub[i] - 0.5)
+                    else:
+                        c_ub[i] = T.sqrt(T.abs(a_ub[i]) + 0.25)
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_vectorize_emits_vabs():
+    source = _lower(_unary_kernel(256, 128, 0), target="pto").kernel_source
+    assert "pto.vmi.vabs(" in source
+
+
+@pytest.mark.pto
+def test_vectorize_emits_vsqrt():
+    source = _lower(_unary_kernel(256, 128, 1), target="pto").kernel_source
+    assert "pto.vmi.vsqrt(" in source
+
+
+# ---------------------------------------------------------------------------
+# Review round 3: lane-use semantics for the uniform-float rejection
+# ---------------------------------------------------------------------------
+
+
+def _varying_bind_then_unary_kernel(n, lanes):
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    # x is lane-varying through the bind; the uniform-float
+                    # rejection must NOT fire for exp(x) even though the
+                    # expression text does not mention the loop var.
+                    x = a_ub[i] * 2.0
+                    c_ub[i] = T.exp(x)
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_varying_bind_unary_accepted():
+    source = _lower(_varying_bind_then_unary_kernel(256, 128), target="pto").kernel_source
+    assert "pto.vmi.vexp(" in source
+    assert "pto.vmi.vmul(" in source
+
+
+def _chunk_uniform_float_kernel(n, lanes):
+    @T.prim_func
+    def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), "float32")
+            c_ub = T.alloc_shared((n,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    # The address is uniform within a chunk (i // 128 * 128)
+                    # but the expression mentions the loop var. The
+                    # lane-use analysis classifies the load as uniform, so
+                    # the float arithmetic must be rejected even though a
+                    # syntactic loop-var check would have skipped it.
+                    c_ub[i] = a_ub[(i // 128) * 128] + 1.0
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_chunk_uniform_float_rejected():
+    with pytest.raises(
+        Exception,
+        match=r"runtime lane-uniform float computation.*scalar float ALU",
+    ):
+        _lower(_chunk_uniform_float_kernel(256, 128), target="pto")

@@ -466,3 +466,52 @@ def test_handwritten_vmi_mixed_with_parallel_is_rejected():
     assert error is not None, "mixing hand-written VMI with T.Parallel must be rejected"
     message = str(error)
     assert "mixing" in message or "cannot be mixed" in message, f"expected the hand-written VMI mixing diagnostic, got: {message}"
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: op-level dtype matrix for sub/div/unary
+# ---------------------------------------------------------------------------
+
+
+def _binary_kernel(n, lanes, dtype, op):
+    @T.prim_func
+    def main(A: T.Tensor((n,), dtype), B: T.Tensor((n,), dtype), C: T.Tensor((n,), dtype)):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((n,), dtype)
+            b_ub = T.alloc_shared((n,), dtype)
+            c_ub = T.alloc_shared((n,), dtype)
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(n):
+                    if op == "sub":
+                        c_ub[i] = a_ub[i] - b_ub[i]
+                    else:
+                        c_ub[i] = a_ub[i] / b_ub[i]
+            T.copy(c_ub, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_verify_bf16_div_rejected():
+    with pytest.raises(Exception, match=r"vdiv on .*bfloat16.*operation matrix"):
+        _lower(_binary_kernel(128, 128, "bfloat16", "div"), target="pto")
+
+
+@pytest.mark.pto
+def test_verify_uint16_div_rejected():
+    with pytest.raises(Exception, match=r"vdiv on uint16.*operation matrix"):
+        _lower(_binary_kernel(128, 128, "uint16", "div"), target="pto")
+
+
+@pytest.mark.pto
+def test_verify_fp8_sub_rejected():
+    with pytest.raises(Exception, match=r"FP8 arithmetic is not supported"):
+        _lower(_binary_kernel(128, 128, "float8_e4m3fn", "sub"), target="pto")
+
+
+@pytest.mark.pto
+def test_verify_fp8_div_rejected():
+    with pytest.raises(Exception, match=r"FP8 arithmetic is not supported"):
+        _lower(_binary_kernel(128, 128, "float8_e5m2", "div"), target="pto")

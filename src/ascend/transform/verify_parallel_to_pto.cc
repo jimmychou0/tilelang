@@ -589,15 +589,38 @@ private:
           CheckOneOp("vadd", add->dtype, add->a, add->b);
           return;
         }
+        if (const auto *sub = e.as<SubNode>()) {
+          check(sub->a);
+          check(sub->b);
+          CheckOneOp("vsub", sub->dtype, sub->a, sub->b);
+          return;
+        }
         if (const auto *mul = e.as<MulNode>()) {
           check(mul->a);
           check(mul->b);
           CheckOneOp("vmul", mul->dtype, mul->a, mul->b);
           return;
         }
+        if (const auto *div = e.as<DivNode>()) {
+          check(div->a);
+          check(div->b);
+          CheckOneOp("vdiv", div->dtype, div->a, div->b);
+          return;
+        }
         if (const auto *cast = e.as<CastNode>()) {
           check(cast->value);
           return;
+        }
+        if (const auto *call = e.as<CallNode>()) {
+          if (auto call_op = call->op.as<Op>()) {
+            const std::string &name = call_op.value()->name;
+            if (name == "tirx.fabs" || name == "tirx.exp" ||
+                name == "tirx.log" || name == "tirx.sqrt") {
+              check(call->args[0]);
+              CheckOneUnaryOp(name.c_str(), call->dtype, call->args[0]);
+              return;
+            }
+          }
         }
         if (const auto *load = e.as<BufferLoadNode>()) {
           // Index arithmetic is address analysis, not value arithmetic.
@@ -607,6 +630,45 @@ private:
         // Vars/constants carry no operation to check.
       };
       check(expr);
+    }
+
+    void CheckOneUnaryOp(const char *op_name, DataType dtype,
+                         const PrimExpr &arg) {
+      pto_analysis::LaneUseContext ctx = MakeLaneUseContext();
+      std::string why;
+      pto_analysis::LaneUse a = pto_analysis::AnalyzeLaneUse(arg, &ctx, &why);
+      if (a == pto_analysis::LaneUse::kUnknown) {
+        return;
+      }
+      const bool vector_op = a == pto_analysis::LaneUse::kVarying;
+      if (pto_analysis::IsSupportedFloat8(dtype)) {
+        std::ostringstream oss;
+        oss << op_name << " on "
+            << (vector_op ? "lane-varying " : "lane-uniform ") << dtype
+            << " is not supported (FP8 arithmetic is out of scope; convert "
+               "to float32 explicitly first)";
+        parent_->Fail("dtype", oss.str());
+      }
+      if (vector_op) {
+        if (!pto_analysis::IsSupportedVectorUnaryOp(op_name, dtype)) {
+          std::ostringstream oss;
+          oss << op_name << " on " << dtype
+              << " elements is not supported by the VMI operation matrix "
+                 "in the first version";
+          parent_->Fail("dtype", oss.str());
+        }
+        return;
+      }
+      if (pto_analysis::IsFloatFamily(dtype) &&
+          pto_analysis::ContainsRuntimeValue(arg)) {
+        std::ostringstream oss;
+        oss << op_name << " on " << dtype
+            << " is a runtime lane-uniform float computation; it stays "
+               "scalar inside SIMD_VF (no scalar float ALU by design). "
+               "Compute it outside the SimdVF region, or wait for the "
+               "gather/scatter milestone for vector write-back";
+        parent_->Fail("dtype", oss.str());
+      }
     }
 
     void CheckOneOp(const char *op_name, DataType dtype, const PrimExpr &lhs,
@@ -646,6 +708,21 @@ private:
           parent_->Fail("dtype", oss.str());
         }
         return;
+      }
+      // Lane-uniform stays scalar by design, so a runtime-valued float
+      // computation here runs on the scalar float ALU inside SIMD_VF.
+      // Compile-time constants fold and integer scalars have no such
+      // premise, so only float-family runtime values are rejected.
+      if (pto_analysis::IsFloatFamily(dtype) &&
+          (pto_analysis::ContainsRuntimeValue(lhs) ||
+           pto_analysis::ContainsRuntimeValue(rhs))) {
+        std::ostringstream oss;
+        oss << op_name << " on " << dtype
+            << " is a runtime lane-uniform float computation; it stays "
+               "scalar inside SIMD_VF (no scalar float ALU by design). "
+               "Compute it outside the SimdVF region, or wait for the "
+               "gather/scatter milestone for vector write-back";
+        parent_->Fail("dtype", oss.str());
       }
       // Pure scalar op: base dtype legality only (int8 scalar mul is
       // fine; int24/FP64 still rejected by the base dtype rule).

@@ -579,7 +579,9 @@ public:
     }
   }
   void VisitExpr_(const AddNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const SubNode *op) final { ExprVisitor::VisitExpr_(op); }
   void VisitExpr_(const MulNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const DivNode *op) final { ExprVisitor::VisitExpr_(op); }
   void VisitExpr_(const CastNode *op) final {
     // Only the converted value is a computation value. The base visitor also
     // walks PrimExpr entries of the cast annotations, which would put a
@@ -588,15 +590,6 @@ public:
     // legality is decided by PlanValueCast, from the raw annotations.
     VisitExpr(op->value);
   }
-  void VisitExpr_(const CallNode *op) final {
-    std::string name = "call";
-    if (const auto *op_node = op->op.as<OpNode>()) {
-      name = op_node->name;
-    }
-    unsupported = "unsupported Call `" + name +
-                  "` (only buffer loads, constants, "
-                  "scalars, loop indices, Add, Mul and Cast are supported)";
-  }
   // The base ExprVisitor overrides VisitExpr_ for every standard node and
   // silently descends, so non-whitelist nodes never reach
   // VisitExprDefault_. Reject them explicitly.
@@ -604,11 +597,10 @@ public:
     if (!unsupported.has_value()) {
       unsupported = std::string("unsupported expression node `") + kind +
                     "` (only buffer loads, constants, "
-                    "scalars, loop indices, Add, Mul and Cast are supported)";
+                    "scalars, loop indices, Add, Sub, Mul, Div, "
+                    "fabs/exp/log/sqrt and Cast)";
     }
   }
-  void VisitExpr_(const SubNode *) final { MarkUnsupported("Sub"); }
-  void VisitExpr_(const DivNode *) final { MarkUnsupported("Div"); }
   void VisitExpr_(const ModNode *) final { MarkUnsupported("Mod"); }
   void VisitExpr_(const FloorDivNode *) final { MarkUnsupported("FloorDiv"); }
   void VisitExpr_(const FloorModNode *) final { MarkUnsupported("FloorMod"); }
@@ -623,11 +615,58 @@ public:
   void VisitExpr_(const AndNode *) final { MarkUnsupported("And"); }
   void VisitExpr_(const OrNode *) final { MarkUnsupported("Or"); }
   void VisitExpr_(const NotNode *) final { MarkUnsupported("Not"); }
-  void VisitExpr_(const SelectNode *) final { MarkUnsupported("Select"); }
+  void VisitExpr_(const SelectNode *) final {
+    if (!unsupported.has_value()) {
+      unsupported =
+          "Select is not vectorizable yet (integer T.abs lowers to Select; "
+          "it arrives with the PR-2 Select/cmp support)";
+    }
+  }
   void VisitExpr_(const RampNode *) final { MarkUnsupported("Ramp"); }
   void VisitExpr_(const BroadcastNode *) final { MarkUnsupported("Broadcast"); }
   void VisitExpr_(const ShuffleNode *) final { MarkUnsupported("Shuffle"); }
   void VisitExpr_(const ReduceNode *) final { MarkUnsupported("Reduce"); }
+  void VisitExpr_(const CallNode *op) final {
+    if (auto call_op = op->op.as<Op>()) {
+      const std::string &name = call_op.value()->name;
+      // Hardware-backed unary math. fabs/exp/log/sqrt map to the VMI
+      // vabs/vexp/vln/vsqrt instructions; the dtype matrix mirrors the
+      // ISA documentation (see IsSupportedVectorUnaryOp).
+      if (name == "tirx.fabs" || name == "tirx.exp" || name == "tirx.log" ||
+          name == "tirx.sqrt") {
+        if (op->args.size() != 1U) {
+          if (!unsupported.has_value()) {
+            unsupported = name + " expects exactly one operand";
+          }
+          return;
+        }
+        const DataType arg = op->args[0].dtype();
+        if (!IsSupportedVectorUnaryOp(name, arg)) {
+          if (!unsupported.has_value()) {
+            std::ostringstream oss;
+            oss << arg;
+            unsupported = name + " vectorization does not support " +
+                          oss.str() +
+                          " operands (per the VMI operation matrix)";
+          }
+          return;
+        }
+        ExprVisitor::VisitExpr_(op);
+        return;
+      }
+    }
+    {
+      std::string name = "call";
+      if (const auto *op_node = op->op.as<OpNode>()) {
+        name = op_node->name;
+      }
+      if (!unsupported.has_value()) {
+        unsupported = "unsupported Call `" + name +
+                      "` (only tirx.fabs/exp/log/sqrt are vectorizable)";
+      }
+    }
+  }
+
   void VisitExprDefault_(const ffi::Object *op) final {
     std::string key = op->GetTypeKey();
     MarkUnsupported(key.c_str());
@@ -924,6 +963,17 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
       return LaneUse::kUnknown;
     }
   }
+  // Hardware-backed unary math shares the whitelist's contract (float32
+  // tirx.fabs/exp/log/sqrt): recurse into the single operand.
+  if (const auto *call = expr.as<CallNode>()) {
+    if (auto call_op = call->op.as<Op>()) {
+      const std::string &name = call_op.value()->name;
+      if (name == "tirx.fabs" || name == "tirx.exp" || name == "tirx.log" ||
+          name == "tirx.sqrt") {
+        return AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
+      }
+    }
+  }
   // Binary/relational/boolean operators: both value and metadata modes
   // recurse into operands; the *type* checks live in the callers.
   LaneUse lhs, rhs;
@@ -937,7 +987,7 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
   } else if (const auto *sub = expr.as<SubNode>()) {
     a = &sub->a;
     b = &sub->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *mul = expr.as<MulNode>()) {
     a = &mul->a;
     b = &mul->b;
@@ -945,7 +995,7 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
   } else if (const auto *div = expr.as<DivNode>()) {
     a = &div->a;
     b = &div->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *mod = expr.as<ModNode>()) {
     a = &mod->a;
     b = &mod->b;
@@ -1045,23 +1095,68 @@ LaneUse AnalyzeLaneUseMeta(const PrimExpr &expr, LaneUseContext *ctx,
   return AnalyzeLaneUseImpl(expr, ctx, reason, /*metadata_mode=*/true);
 }
 
-bool IsSupportedVectorBinaryOp(const std::string &vmi_op, DataType dtype) {
-  // Operation-level matrix (per the VMI verifier):
-  //   vmul requires i16/i32/f16/bf16/f32; vadd additionally allows i8.
-  int bits = dtype.bits();
-  if (vmi_op == "vmul") {
-    if (dtype.is_int() || dtype.is_uint()) {
-      return bits == 16 || bits == 32;
-    }
+bool IsSupportedVectorUnaryOp(const std::string &tirx_op, DataType dtype) {
+  // Per the VMI ISA documentation: vabs admits f16/bf16/f32 (the vabs
+  // instruction also takes si8/si16/si32, but the frontend abs() lowers
+  // integers to Select — PR-2 territory — and returns unsigned inputs
+  // unchanged, so integer dtypes never reach this gate); vexp/vln/vsqrt
+  // admit f16/f32 only.
+  const int bits = dtype.bits();
+  if (tirx_op == "tirx.fabs") {
     return (dtype.is_float() || dtype.is_bfloat16()) &&
            (bits == 16 || bits == 32);
   }
-  if (vmi_op == "vadd") {
-    if (dtype.is_int() || dtype.is_uint()) {
-      return bits == 8 || bits == 16 || bits == 32;
+  if (tirx_op == "tirx.exp" || tirx_op == "tirx.log" ||
+      tirx_op == "tirx.sqrt") {
+    return dtype.is_float() && (bits == 16 || bits == 32);
+  }
+  return false;
+}
+
+bool ExprUsesVar(const PrimExpr &expr, const VarNode *var) {
+  bool uses = false;
+  PostOrderVisit(expr, [&](const ObjectRef &n) {
+    if (n.as<VarNode>() == var) {
+      uses = true;
     }
-    return (dtype.is_float() || dtype.is_bfloat16()) &&
-           (bits == 16 || bits == 32);
+  });
+  return uses;
+}
+
+bool ContainsRuntimeValue(const PrimExpr &expr) {
+  // True when the expression reads any runtime value: a Var (external
+  // scalar, serial coordinate, scalar buffer base) or a BufferLoad.
+  // A pure IntImm/FloatImm tree is a compile-time constant.
+  bool has_runtime = false;
+  PostOrderVisit(expr, [&](const ObjectRef &n) {
+    if (n.as<VarNode>() != nullptr || n.as<BufferLoadNode>() != nullptr) {
+      has_runtime = true;
+    }
+  });
+  return has_runtime;
+}
+
+bool IsFloatFamily(DataType dtype) {
+  return dtype.is_float() || dtype.is_bfloat16();
+}
+
+bool IsSupportedVectorBinaryOp(const std::string &vmi_op, DataType dtype) {
+  // Operation-level matrix (per the VMI ISA documentation):
+  //   vmul requires i16/i32/f16/bf16/f32; vadd/vsub additionally allow i8;
+  //   vdiv admits f16/f32 only (no bf16, no integers).
+  int bits = dtype.bits();
+  const bool is_int_like = dtype.is_int() || dtype.is_uint();
+  const bool is_fp_like =
+      (dtype.is_float() || dtype.is_bfloat16()) && (bits == 16 || bits == 32);
+  if (vmi_op == "vmul") {
+    return (is_int_like && (bits == 16 || bits == 32)) || is_fp_like;
+  }
+  if (vmi_op == "vadd" || vmi_op == "vsub") {
+    return (is_int_like && (bits == 8 || bits == 16 || bits == 32)) ||
+           is_fp_like;
+  }
+  if (vmi_op == "vdiv") {
+    return dtype.is_float() && (bits == 16 || bits == 32);
   }
   return false;
 }
@@ -1341,13 +1436,24 @@ Optional<CastPlan> PlanValueCast(const CastNode *cast, std::string *reason) {
     }
     return finish(plan);
   }
-  if (from.is_float() && to.is_float()) {
-    if (to.bits() > from.bits()) {
+  if (from.is_float() && (to.is_float() || to.is_bfloat16())) {
+    if (to.bits() > from.bits() && to.is_float()) {
       // f16 -> f32 widening is exact.
       return finish(plan);
     }
-    // float narrowing needs rounding semantics proof; reject for now.
-    return reject("float narrowing has no validated rounding semantics");
+    // f32 -> f16/bf16 narrowing: TIR Cast rounds to nearest; pin R so the
+    // VMI vcvt never depends on PTODSL defaults. NOSAT keeps IEEE
+    // overflow-to-inf semantics instead of clamping to the largest finite.
+    if (from.bits() == 32 && to.bits() == 16) {
+      plan.rounding = "R";
+      plan.saturate = "NOSAT";
+      return finish(plan);
+    }
+    // The only float narrowing left here is the cross-family f16 <-> bf16
+    // step; its rounding semantics are not validated.
+    return reject(
+        "cross-family f16 <-> bf16 narrowing has no validated rounding "
+        "semantics; convert through float32 explicitly");
   }
   // Bfloat16's is_float() is false, so bf16 -> f32 fell into the
   // reject branch below even though it is the same exact widening as

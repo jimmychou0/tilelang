@@ -206,11 +206,15 @@ struct CastPlan {
   std::string rounding;
 };
 
-/*! Operation-level type support for the vector arithmetic emitted here.
- * VMI vmul only supports i16/i32/f16/bf16/f32
- * elements; vadd additionally allows i8. Unsupported combinations are
- * rejected instead of synthesizing widening chains. */
+/*! Operation-level type support for the vector arithmetic the first
+ * version emits. VMI vmul only supports i16/i32/f16/bf16/f32
+ * elements; vadd/vsub additionally allow i8; vdiv admits f16/f32 only.
+ * Unsupported combinations are rejected instead of synthesizing
+ * widening chains. */
+bool IsSupportedVectorUnaryOp(const std::string &tirx_op, DataType dtype);
 bool IsSupportedVectorBinaryOp(const std::string &vmi_op, DataType dtype);
+bool ContainsRuntimeValue(const PrimExpr &expr);
+bool IsFloatFamily(DataType dtype);
 
 /*! Read-only lane-use classification of a value expression.
  * Shared by the metadata check and the operation type check so both

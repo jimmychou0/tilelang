@@ -36,6 +36,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 #include "parallel_to_pto_utils.h"
@@ -132,8 +133,10 @@ private:
     // are rejected there, and opaque calls are already excluded
     // from addresses.
     static const std::set<std::string> kDiscardable = {
-        "tl.vmi.vload", "tl.vmi.vbrc", "tl.vmi.vci",    "tl.vmi.vadd",
-        "tl.vmi.vmul",  "tl.vmi.vcvt", "tl.access_ptr",
+        "tl.vmi.vload",  "tl.vmi.vbrc", "tl.vmi.vci",   "tl.vmi.vadd",
+        "tl.vmi.vsub",   "tl.vmi.vmul", "tl.vmi.vdiv",  "tl.vmi.vabs",
+        "tl.vmi.vexp",   "tl.vmi.vln",  "tl.vmi.vsqrt", "tl.vmi.vcvt",
+        "tl.access_ptr",
     };
     bool discardable = true;
     PostOrderVisit(rhs, [&](const ObjectRef &n) {
@@ -789,10 +792,43 @@ private:
       return expr;
     }
     if (const auto *add = expr.as<AddNode>()) {
-      return ConvertBinary(add->a, add->b, "vadd", true, pre);
+      return ConvertBinary(add->a, add->b, "vadd", pre);
+    }
+    if (const auto *sub = expr.as<SubNode>()) {
+      return ConvertBinary(sub->a, sub->b, "vsub", pre);
     }
     if (const auto *mul = expr.as<MulNode>()) {
-      return ConvertBinary(mul->a, mul->b, "vmul", false, pre);
+      return ConvertBinary(mul->a, mul->b, "vmul", pre);
+    }
+    if (const auto *div = expr.as<DivNode>()) {
+      return ConvertBinary(div->a, div->b, "vdiv", pre);
+    }
+    if (const auto *call = expr.as<CallNode>()) {
+      // Hardware-backed unary math (fabs/exp/log/sqrt); the dtype matrix
+      // mirrors the ISA documentation (see IsSupportedVectorUnaryOp).
+      static const std::unordered_map<std::string, std::string> kUnaryMap = {
+          {"tirx.fabs", "vabs"},
+          {"tirx.exp", "vexp"},
+          {"tirx.log", "vln"},
+          {"tirx.sqrt", "vsqrt"}};
+      auto call_op = call->op.as<Op>();
+      ICHECK(call_op.has_value())
+          << "[VectorizeParallelToPTO] internal error: non-Op call passed "
+             "Verify: "
+          << expr;
+      auto it = kUnaryMap.find(call_op.value()->name);
+      ICHECK(it != kUnaryMap.end())
+          << "[VectorizeParallelToPTO] internal error: call passed Verify "
+             "without a VMI mapping: "
+          << call_op.value()->name;
+      PrimExpr a = ConvertExpr(call->args[0], pre);
+      if (a.dtype().lanes() == 1) {
+        return Call(expr.dtype(), call->op, {a});
+      }
+      return EmitBind(it->second,
+                      Call(VectorDType(expr.dtype().element_of(), lanes_),
+                           VmiOp(it->second), {a, mask_var_}),
+                      pre);
     }
     if (const auto *cast = expr.as<CastNode>()) {
       PrimExpr value = ConvertExpr(cast->value, pre);
@@ -839,14 +875,28 @@ private:
   }
 
   PrimExpr ConvertBinary(const PrimExpr &lhs, const PrimExpr &rhs,
-                         const std::string &vmi_name, bool is_add,
-                         Array<Stmt> *pre) {
+                         const std::string &vmi_name, Array<Stmt> *pre) {
     PrimExpr a = ConvertExpr(lhs, pre);
     PrimExpr b = ConvertExpr(rhs, pre);
     bool a_vec = a.dtype().lanes() > 1;
     bool b_vec = b.dtype().lanes() > 1;
     if (!a_vec && !b_vec) {
-      return is_add ? (a + b) : (a * b);
+      // Lane-uniform folds stay scalar with the TIR semantics of the node.
+      if (vmi_name == "vadd") {
+        return a + b;
+      }
+      if (vmi_name == "vsub") {
+        return a - b;
+      }
+      if (vmi_name == "vmul") {
+        return a * b;
+      }
+      if (vmi_name == "vdiv") {
+        return div(a, b);
+      }
+      ICHECK(false) << "[VectorizeParallelToPTO] internal error: unknown "
+                       "binary op "
+                    << vmi_name;
     }
     if (a_vec && !b_vec) {
       b = EmitBind(
