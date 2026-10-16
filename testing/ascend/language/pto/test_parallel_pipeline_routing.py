@@ -224,10 +224,8 @@ def test_pto_handwritten_vmi_without_parallel_is_accepted():
 
 
 @pytest.mark.pto
-def test_plan_pto_slot_storage_is_not_registered_or_called():
-    assert not hasattr(ascend_transform, _SLOT_STORAGE_PASS), (
-        "PlanPtoSlotStorage belongs to a later pipeline stage and must not be registered yet"
-    )
+def test_plan_pto_slot_storage_is_registered_and_runs_on_the_pto_route():
+    assert hasattr(ascend_transform, _SLOT_STORAGE_PASS), "PlanPtoSlotStorage is the slot-storage planning stage and must be registered"
     artifact, names = _lower_with_trace(_simdvf_parallel_kernel(), "pto")
-    assert not any(_SLOT_STORAGE_PASS in name for name in names), "no PlanPtoSlotStorage step may run"
-    _maybe_dump_artifacts("pto-slot-storage-absence", names, artifact)
+    assert any(_SLOT_STORAGE_PASS in name for name in names), f"the PTO route must run PlanPtoSlotStorage; trace tail: {names[-12:]}"
+    _maybe_dump_artifacts("pto-slot-storage-presence", names, artifact)

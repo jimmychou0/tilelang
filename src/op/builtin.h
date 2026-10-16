@@ -349,6 +349,13 @@ TVM_DLL const Op &vmi_vload();
 TVM_DLL const Op &vmi_vstore();
 TVM_DLL const Op &vmi_create_mask();
 
+// -- PTO slot storage (compiler-managed vector-array objects backed by a
+// reserved unified-buffer region; the physical residency — registers or
+// actual UB traffic — is decided by PTOAS).
+TVM_DLL const Op &vmi_slot_alloc();
+TVM_DLL const Op &vmi_slot_load();
+TVM_DLL const Op &vmi_slot_store();
+
 // -- Index / Broadcast / Rearrange
 TVM_DLL const Op &vmi_vci();
 TVM_DLL const Op &vmi_vbrc();

@@ -4973,6 +4973,34 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
     print_ptr_with_offset(op->args[1], op->args[2]);
     os << ", " << PrintExpr_(op->args[3]) << ", " << PrintExpr_(op->args[4]);
     needs_comma = true;
+  } else if (op_name == "tl.vmi.slot_alloc") {
+    // (backing_ptr, count, vector_type): the backing address prints
+    // through the shared access-ptr printers (tl.access_ptr before
+    // LowerAccessPtr, tvm_access_ptr after the address pass chain); count
+    // and vector_type are compile-time metadata. The vector type uses the
+    // PTODSL spelling (e.g. pto.vmi.f32x128). This branch is the single
+    // place to reconcile if the PTOAS slot ABI settles on a different
+    // parameter shape (kwargs or a type object).
+    ICHECK_EQ(op->args.size(), 3U)
+        << op_name << " expects (backing_ptr, count, vector_type)";
+    const auto *vector_type = op->args[2].as<StringImmNode>();
+    ICHECK(vector_type != nullptr)
+        << op_name << " vector_type must be a string literal";
+    const std::string tvm_vector_name = vector_type->value;
+    const size_t split = tvm_vector_name.rfind('x');
+    ICHECK(split != std::string::npos && split + 1 < tvm_vector_name.size())
+        << op_name << " vector_type must look like <dtype>x<lanes>, got "
+        << tvm_vector_name;
+    const std::string scalar =
+        ScalarType(ParseDataType(tvm_vector_name.substr(0, split)));
+    static const std::string kPtoPrefix = "pto.";
+    ICHECK(scalar.rfind(kPtoPrefix, 0) == 0)
+        << op_name << ": scalar type spelling for "
+        << tvm_vector_name.substr(0, split) << " is not a pto type: " << scalar;
+    os << PrintExpr_(op->args[0]) << ", " << PrintExpr_(op->args[1])
+       << ", pto.vmi." << scalar.substr(kPtoPrefix.size()) << "x"
+       << tvm_vector_name.substr(split + 1);
+    needs_comma = true;
   } else if (op_name == "tl.vmi.vstore") {
     auto dist_mode_it = op->annotations.find("dist_mode");
     ObjectRef dist_mode = dist_mode_it != op->annotations.end()
