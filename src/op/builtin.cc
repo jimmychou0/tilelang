@@ -163,6 +163,13 @@ TIR_DEFINE_TL_BUILTIN(sync_warp).set_num_inputs(-1).set_attr<TCallEffectKind>(
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vload).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vstore).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(create_mask).set_num_inputs(-1);
+// PTO slot storage: alloc establishes the object (binding it to the
+// reserved backing region), store overwrites a whole entry, load reads one
+// back — none are pure (load depends on memory state), so all three stay
+// opaque to DCE/CSE at the TIR level.
+TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(slot_alloc).set_num_inputs(-1);
+TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(slot_load).set_num_inputs(-1);
+TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(slot_store).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vci).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vbrc).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vintlv).set_num_inputs(-1);
