@@ -44,13 +44,17 @@
 #include <tvm/tirx/transform.h>
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
 
+#include "../../op/operator.h"
+#include "../op/builtin.h"
 #include "parallel_to_pto_utils.h"
+#include "pto_slot_plan.h"
 
 namespace tvm {
 namespace tl {
@@ -267,7 +271,10 @@ private:
   // ------------------------------------------------------------------
   Stmt VisitStmt_(const SBlockNode *op) final {
     if (op->name_hint != "SIMD_VF") {
-      return StmtExprMutator::VisitStmt_(op);
+      block_stack_.push_back(op);
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      block_stack_.pop_back();
+      return result;
     }
     // Shared region scan: the same implementation Verify uses, so
     // skip/reject/convert decisions cannot drift apart.
@@ -276,7 +283,10 @@ private:
     if (!scan.has_any_parallel) {
       // Pure hand-written VMI region (possibly with control flow): skipped
       // by both passes; no lanes annotation needed.
-      return StmtExprMutator::VisitStmt_(op);
+      block_stack_.push_back(op);
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      block_stack_.pop_back();
+      return result;
     }
     ICHECK(!scan.has_unsupported_wrapper)
         << "[VectorizeParallelToPTO] internal error: unsupported wrapper "
@@ -286,6 +296,9 @@ private:
         << "[VectorizeParallelToPTO] internal error: parallel units lost "
            "after scan";
 
+    // Track the block on the annotation chain for the slot-state lookups
+    // in ConvertRegionBody (fragment layouts and plans).
+    block_stack_.push_back(op);
     // Plan A: a serial loop that carries a shared buffer through UB (a unit
     // that both loads and stores the same buffer) has no ordering point
     // inside one vecscope — every synchronisation operation delimits a
@@ -297,16 +310,20 @@ private:
     if (!RegionIsCarryPromotable(region, scan)) {
       Stmt split = TrySplitCarriedLoop(op, region);
       if (split.defined()) {
+        block_stack_.pop_back();
         return split;
       }
     }
-    return RebuildSBlock(op, ConvertRegionBody(region));
+    Stmt result = RebuildSBlock(op, ConvertRegionBody(region));
+    block_stack_.pop_back();
+    return result;
   }
 
+  // Rebuild a converting region's block. Fragment allocations consumed by
+  // the conversion (and their annotations/regions) are dropped here, which
+  // also covers the sub-blocks produced by the vecscope split below.
   Stmt RebuildSBlock(const SBlockNode *op, Stmt body) {
-    return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
-                  std::move(body), op->init, op->alloc_buffers,
-                  op->match_buffers, op->annotations);
+    return RebuildBlockWithoutConsumedFragments(op, std::move(body));
   }
 
   // True when AnalyzeRegionCarry would promote this region (the carry path
@@ -333,8 +350,13 @@ private:
     return false;
   }
 
-  // Convert one SIMD_VF region body: mask plan, carry promotion, units.
+  // Convert one SIMD_VF region body: mask plan, slot state, carry promotion,
+  // units.
   Stmt ConvertRegionBody(const Stmt &region) {
+    // Reset the region-level slot state: every local.fragment buffer of
+    // this converting region maps to one reserved backing (shared by all
+    // sequential units — e.g. an accumulator kept across units).
+    BuildSlotState();
     pto_analysis::PtoRegionScan scan = pto_analysis::ScanPtoRegion(region);
     ICHECK(!scan.units.empty())
         << "[VectorizeParallelToPTO] internal error: parallel units lost "
@@ -385,7 +407,6 @@ private:
         new_region =
             SeqStmt::Flatten(Bind(shared_mask_, mask_value), new_region);
       }
-    }
 
     // Convert each sequential unit in order; unit state (bind
     // maps, counters) is reset per unit; the shared full mask, when
@@ -415,6 +436,16 @@ private:
     }
     for (size_t i = 0; i < scan.units.size(); ++i) {
       Stmt converted = ConvertUnit(scan.units[i], mappings[i], region);
+      // A unit that writes a fragment backing is followed by a vecscope
+      // mem_bar: the next unit's backing loads are a RAW dependency
+      // through UB, and TileLang does not rely on a backend
+      // auto-inserting the barrier. The mem-to-value promotion deletes
+      // the bar again whenever it forwards the round trip.
+      if (unit_wrote_backing_) {
+        converted = SeqStmt::Flatten(
+            converted, Evaluate(Call(DataType::Void(), tl::simd_mem_bar(),
+                                     {StringImm("VST_VLD")})));
+      }
       new_region = ReplaceStmt(new_region, scan.units[i], converted);
     }
     if (region_carry_.active) {
@@ -422,6 +453,7 @@ private:
                                     new_region);
       region_carry_ = RegionCarry();
     }
+    CheckNoResidualFragmentAccess(new_region);
     return new_region;
   }
 
@@ -605,6 +637,180 @@ private:
     LOG(INFO) << "[split] vecscope split: carriers=" << carriers.size()
               << " parts=" << out.size();
     return SeqStmt::Flatten(out);
+  }
+
+  // ------------------------------------------------------------------
+  // PTO slot storage state (region level)
+  // ------------------------------------------------------------------
+  struct SlotState {
+    PtoSlotPlan plan;
+    Fragment layout;
+  };
+
+  // Load the slot plans and fragment layouts recorded on the SBlock chain
+  // (innermost first — the converting block itself and its ancestors; both
+  // PlanPtoSlotStorage and the layout writeback place them there).
+  void BuildSlotState() {
+    slot_map_.clear();
+    converted_fragments_.clear();
+    for (auto it = block_stack_.rbegin(); it != block_stack_.rend(); ++it) {
+      auto plans_value = (*it)->annotations.Get(kPtoSlotPlan);
+      if (!plans_value.has_value()) {
+        continue;
+      }
+      auto plans = plans_value.value().try_cast<Array<PtoSlotPlan>>();
+      ICHECK(plans.has_value())
+          << "[VectorizeParallelToPTO] internal error: annotation "
+          << kPtoSlotPlan << " must be an Array<PtoSlotPlan>";
+      for (const PtoSlotPlan &plan : plans.value()) {
+        if (slot_map_.count(plan->fragment) != 0) {
+          continue;
+        }
+        const Fragment layout = FindFragmentLayout(plan->fragment);
+        ICHECK(layout.defined())
+            << "[VectorizeParallelToPTO] internal error: fragment buffer `"
+            << plan->fragment->name
+            << "` has a slot plan but no layout_map entry";
+        slot_map_.emplace(plan->fragment, SlotState{plan, layout});
+      }
+    }
+  }
+
+  Fragment FindFragmentLayout(const Buffer &buffer) const {
+    for (auto it = block_stack_.rbegin(); it != block_stack_.rend(); ++it) {
+      auto value = (*it)->annotations.Get(attr::kLayoutMap);
+      if (!value.has_value()) {
+        continue;
+      }
+      auto map = value.value().try_cast<LayoutMap>();
+      if (!map.has_value()) {
+        continue;
+      }
+      if (map.value().count(buffer) != 0) {
+        auto frag = map.value()[buffer].as<Fragment>();
+        ICHECK(frag.has_value())
+            << "[VectorizeParallelToPTO] internal error: layout_map entry "
+               "for fragment buffer `"
+            << buffer->name << "` must be a tl.Fragment";
+        return frag.value();
+      }
+    }
+    return Fragment();
+  }
+
+  // Backing access pointer for one entry: the start index is the entry
+  // expression scaled to element offset (entry * L; the identity layout
+  // maps entry q to element q*L), so the address pass chain rewrites it
+  // exactly like an ordinary UB access. Loads read, stores write.
+  PrimExpr MakeBackingAccessPtr(const SlotState &state,
+                                const PrimExpr &entry_elem_offset,
+                                int rw_mask) const {
+    return Call(DataType::Handle(), tl::access_ptr(),
+                {BufferLoad(state.plan->backing, {entry_elem_offset}),
+                 IntImm(DataType::Int(32), static_cast<int>(lanes_)),
+                 IntImm(DataType::Int(32), rw_mask)});
+  }
+
+  // Post-check: every local.fragment access of the region went through the
+  // slot path. A survivor means Verify and Vectorize disagree.
+  void CheckNoResidualFragmentAccess(const Stmt &body) const {
+    class ResidualFinder : public StmtExprVisitor {
+    public:
+      bool found = false;
+      std::string name;
+      void VisitExpr_(const BufferLoadNode *op) final {
+        if (op->buffer.scope() == "local.fragment") {
+          found = true;
+          name = op->buffer->name;
+        }
+        StmtExprVisitor::VisitExpr_(op);
+      }
+      void VisitStmt_(const BufferStoreNode *op) final {
+        if (op->buffer.scope() == "local.fragment") {
+          found = true;
+          name = op->buffer->name;
+        }
+        StmtExprVisitor::VisitStmt_(op);
+      }
+    };
+    ResidualFinder finder;
+    finder(body);
+    ICHECK(!finder.found)
+        << "[VectorizeParallelToPTO] internal error: fragment buffer `"
+        << finder.name << "` access survived conversion";
+  }
+
+  // Drop the consumed fragment allocations, their layout_map entries, the
+  // consumed slot plans and their read/write regions from the rebuilt
+  // block. The backing allocations stay: the emitted backing loads/stores
+  // reference them, and the address pass chain rewrites their base.
+  Stmt RebuildBlockWithoutConsumedFragments(const SBlockNode *op,
+                                            const Stmt &new_body) {
+    if (converted_fragments_.empty()) {
+      return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
+                    new_body, op->init, op->alloc_buffers, op->match_buffers,
+                    op->annotations);
+    }
+    Array<Buffer> alloc_buffers;
+    for (const Buffer &buffer : op->alloc_buffers) {
+      if (converted_fragments_.count(buffer->data.get()) != 0) {
+        continue;
+      }
+      alloc_buffers.push_back(buffer);
+    }
+    Array<BufferRegion> reads, writes;
+    for (const BufferRegion &region : op->reads) {
+      if (converted_fragments_.count(region->buffer->data.get()) == 0) {
+        reads.push_back(region);
+      }
+    }
+    for (const BufferRegion &region : op->writes) {
+      if (converted_fragments_.count(region->buffer->data.get()) == 0) {
+        writes.push_back(region);
+      }
+    }
+    Map<String, Any> annotations;
+    {
+      // Copy through the block's annotation map, dropping the consumed
+      // entries below.
+      for (const auto &[key, value] : op->annotations) {
+        annotations.Set(key, value);
+      }
+    }
+    if (auto value = annotations.Get(attr::kLayoutMap)) {
+      auto map = value.value().try_cast<LayoutMap>();
+      if (map.has_value()) {
+        LayoutMap kept;
+        for (const auto &[buffer, layout] : map.value()) {
+          if (converted_fragments_.count(buffer->data.get()) == 0) {
+            kept.Set(buffer, layout);
+          }
+        }
+        if (kept.empty()) {
+          annotations.erase(attr::kLayoutMap);
+        } else {
+          annotations.Set(attr::kLayoutMap, kept);
+        }
+      }
+    }
+    if (auto value = annotations.Get(kPtoSlotPlan)) {
+      auto plans = value.value().try_cast<Array<PtoSlotPlan>>();
+      if (plans.has_value()) {
+        Array<PtoSlotPlan> kept;
+        for (const PtoSlotPlan &plan : plans.value()) {
+          if (converted_fragments_.count(plan->fragment->data.get()) == 0) {
+            kept.push_back(plan);
+          }
+        }
+        if (kept.empty()) {
+          annotations.erase(kPtoSlotPlan);
+        } else {
+          annotations.Set(kPtoSlotPlan, kept);
+        }
+      }
+    }
+    return SBlock(op->iter_vars, reads, writes, op->name_hint, new_body,
+                  op->init, alloc_buffers, op->match_buffers, annotations);
   }
 
   // Replace one statement (the unit's For) with its conversion, recursing
@@ -1241,6 +1447,7 @@ private:
     bind_env_.clear();
     value_map_.clear();
     tmp_counter_ = 0;
+    unit_wrote_backing_ = false;
     // Keep the complete mapping (2D fields included) for the
     // per-access analysis calls in ConvertBody.
     unit_mapping_ = mapping;
@@ -1562,6 +1769,10 @@ private:
       }
       Array<Stmt> pre;
       PrimExpr value = ConvertExpr(store->value, &pre);
+      if (store->buffer.scope() == "local.fragment") {
+        ConvertFragmentStore(store, value, pre, out);
+        return;
+      }
       auto access = pto_analysis::AnalyzeBufferAccess(
           store->buffer, store->indices, /*is_write=*/true, loop_var_,
           CurrentMapping(), &analyzer_, bind_env_);
@@ -1693,10 +1904,85 @@ private:
   }
 
   // ------------------------------------------------------------------
+  // PTO slot storage conversion (fragment buffer -> plain vload/vstore on
+  // the reserved backing). The entry index comes from the shared fragment
+  // analysis: lane bound to 0 (entries are whole-vector), chunk bound to
+  // the emitted q; entry * L is the element offset into the flat backing.
+  // The physical residency (register forwarding vs. actual UB traffic) is
+  // PTOAS's mem-to-value decision; TileLang only owns the reservation and
+  // the ordering (a mem_bar after each backing-writing unit).
+  // ------------------------------------------------------------------
+  const SlotState &RequireSlotState(const Buffer &buffer) {
+    auto it = slot_map_.find(buffer);
+    ICHECK(it != slot_map_.end())
+        << "[VectorizeParallelToPTO] internal error: fragment buffer `"
+        << buffer->name
+        << "` passed Verify without a slot plan in Vectorize's scope";
+    converted_fragments_.insert(buffer->data.get());
+    return it->second;
+  }
+
+  PrimExpr BackingEntryOffset(const pto_analysis::FragmentAccess &access) {
+    PrimExpr entry =
+        analyzer_.Simplify(BindChunkToQ(SubstituteLaneZero(access.entry_expr)));
+    return analyzer_.Simplify(entry *
+                              IntImm(entry.dtype(), static_cast<int>(lanes_)));
+  }
+
+  PrimExpr ConvertFragmentLoad(const BufferLoadNode *load, Array<Stmt> *pre) {
+    const SlotState &state = RequireSlotState(load->buffer);
+    auto access = pto_analysis::AnalyzeFragmentAccess(
+        load->buffer, load->indices, /*is_write=*/false, loop_var_,
+        CurrentMapping(), state.layout, &analyzer_, bind_env_);
+    PrimExpr ptr =
+        MakeBackingAccessPtr(state, BackingEntryOffset(access), /*rw=*/1);
+    // No CSE and no cross-access reuse: every textual fragment read is its
+    // own vload on the backing (memory semantics; merging and the
+    // store->load forwarding are PTOAS's decisions).
+    return EmitBind(
+        "vload",
+        Call(VectorDType(load->dtype, lanes_), VmiOp("vload"),
+             {ptr, IntImm(DataType::Int(32), 0)},
+             {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+        pre);
+  }
+
+  void ConvertFragmentStore(const BufferStoreNode *store, PrimExpr value,
+                            Array<Stmt> &pre, Array<Stmt> *out) {
+    const SlotState &state = RequireSlotState(store->buffer);
+    auto access = pto_analysis::AnalyzeFragmentAccess(
+        store->buffer, store->indices, /*is_write=*/true, loop_var_,
+        CurrentMapping(), state.layout, &analyzer_, bind_env_);
+    // Backing writes are ordinary masked stores: the chunk mask limits the
+    // write to the valid lanes, so inactive/padding lanes keep the
+    // backing's previous contents (the whole-entry slot semantics). A
+    // scalar RHS broadcasts first, same rule as the continuous path.
+    if (value.dtype().lanes() == 1) {
+      value = EmitBind(
+          "vbrc_val",
+          Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"), {value},
+               {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+          &pre);
+    }
+    PrimExpr ptr =
+        MakeBackingAccessPtr(state, BackingEntryOffset(access), /*rw=*/2);
+    for (const auto &s : pre) {
+      out->push_back(s);
+    }
+    out->push_back(
+        Evaluate(Call(DataType::Void(), VmiOp("vstore"),
+                      {value, ptr, IntImm(DataType::Int(32), 0), mask_var_})));
+    unit_wrote_backing_ = true;
+  }
+
+  // ------------------------------------------------------------------
   // Expression conversion (index vars resolve through bind_env_)
   // ------------------------------------------------------------------
   PrimExpr ConvertExpr(const PrimExpr &expr, Array<Stmt> *pre) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
+      if (load->buffer.scope() == "local.fragment") {
+        return ConvertFragmentLoad(load, pre);
+      }
       if (carry_active_ && IsCarryAccess(load->buffer, load->indices)) {
         // Promoted carry read: the value lives in the vreg buffer.
         return BufferLoad(carry_vreg_, {make_zero(DataType::Int(32))});
@@ -2170,6 +2456,17 @@ private:
 
   arith::Analyzer analyzer_;
   Var shared_mask_; // one full mask per VF, shared by all units
+
+  // SBlocks in lexical scope (innermost last), for annotation lookups.
+  std::vector<const SBlockNode *> block_stack_;
+  // PTO slot storage (region level): fragment buffer -> {plan, layout}.
+  std::unordered_map<Buffer, SlotState, ObjectPtrHash, ObjectPtrEqual>
+      slot_map_;
+  // Data vars of fragments whose accesses were converted in this region.
+  std::set<const VarNode *> converted_fragments_;
+  // True when the unit being converted wrote to a fragment backing (drives
+  // the ordering mem_bar appended after the unit).
+  bool unit_wrote_backing_ = false;
 
   // Per-unit state.
   Var loop_var_;
