@@ -407,6 +407,7 @@ private:
         new_region =
             SeqStmt::Flatten(Bind(shared_mask_, mask_value), new_region);
       }
+    }
 
     // Convert each sequential unit in order; unit state (bind
     // maps, counters) is reset per unit; the shared full mask, when
@@ -476,11 +477,20 @@ private:
   // loops are hoisted level by level), so the innermost iteration — the one
   // whose unit does the read-modify-write — is its own region.
   // ------------------------------------------------------------------
+  static bool IsUbScope(const BufferNode *buf) {
+    const std::string scope = GetRef<Buffer>(buf).scope();
+    return scope == "shared" || scope == "shared.dyn";
+  }
+
   static const BufferNode *UnitUbCarry(const ForNode *unit) {
     ShellAccessCollector acc;
     acc(static_cast<const Stmt &>(unit->body));
     for (const auto &a : acc.accesses) {
-      if (!a.is_store) {
+      if (!a.is_store || !IsUbScope(a.buf)) {
+        // local.fragment carries are ordered by the slot backing's
+        // per-unit mem_bar and must not be split: a split re-declares the
+        // region's allocations per part, which would give one backing
+        // several merged addresses.
         continue;
       }
       for (const auto &b : acc.accesses) {

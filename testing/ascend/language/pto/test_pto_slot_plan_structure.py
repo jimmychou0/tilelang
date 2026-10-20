@@ -328,7 +328,12 @@ def test_vectorize_slot_roundtrip_2d():
 @pytest.mark.pto
 def test_vectorize_two_reads_stay_two_loads():
     """Two textual reads of the same fragment element are two backing
-    vloads (no cross-access reuse at the TileLang level)."""
+    vloads (no cross-access reuse at the TileLang level).
+
+    The consumer is a read-modify-write unit (`keep[i] = keep[i] * keep[i]`)
+    followed by a later read: the pure store->load round-trip elimination in
+    the base pipeline legally forwards a single-store/single-load shape, so
+    the RMW form is what pins down the no-reuse contract."""
     lanes = 128
     E = lanes
 
@@ -343,12 +348,26 @@ def test_vectorize_two_reads_stay_two_loads():
                 for i in T.Parallel(E):
                     keep[i] = a_ub[i]
                 for i in T.Parallel(E):
-                    b_ub[i] = keep[i] * keep[i]
+                    keep[i] = keep[i] * keep[i]
+                for i in T.Parallel(E):
+                    b_ub[i] = keep[i]
             T.copy(b_ub, B)
 
     mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
-    # 1 store round + 2 loads in the consumer round == 2 backing vloads.
-    assert len(_backing_vmi_calls(mod, "vload", "keep_slot_backing")) == 2
+    # RMW round reads keep twice (the two textual reads), the final round
+    # reads once: 3 backing vloads; two writing rounds: 2 backing vstores.
+    loads = _backing_vmi_calls(mod, "vload", "keep_slot_backing")
+    stores = _backing_vmi_calls(mod, "vstore", "keep_slot_backing")
+    assert len(loads) == 3, [str(x) for x in loads]
+    assert len(stores) == 2, [str(x) for x in stores]
+    # The two RMW reads must be two distinct SSA values (no cross-access
+    # reuse): the vmul consumes two different vload bindings.
+    muls = _vmi_calls(mod, "vmul")
+    assert len(muls) == 1
+    mul = muls[0]
+    lhs, rhs = str(mul.args[0]), str(mul.args[1])
+    assert lhs != rhs, f"vmul must consume two distinct loads: {mul}"
+    assert lhs.startswith("vload") and rhs.startswith("vload"), mul
 
 
 # ---------------------------------------------------------------------------
