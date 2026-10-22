@@ -1392,5 +1392,64 @@ def test_cross_unit_war_bar():
 
 
 
+@pytest.mark.pto
+def test_unaligned_fill_expands_predicated():
+    """G2: an unaligned fill region (min 64 at VL=128) expands to the
+    predicated whole-entry form instead of being rejected."""
+    lanes = 128
+
+    @T.prim_func
+    def main(B: T.Tensor((2 * lanes,), "float32")):
+        with T.Kernel(1):
+            b_ub = T.alloc_shared((2 * lanes,), "float32")
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((2 * lanes,), "float32")
+                T.fill(keep[lanes // 2 : lanes // 2 + lanes], T.float32(7.0))
+                for i in T.Parallel(lanes):
+                    keep[i] = keep[i] + T.float32(1.0)
+                for i in T.Parallel(2 * lanes):
+                    b_ub[i] = keep[i]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    handle = "keep_fragment_mem"
+    # predicated fill round: 1 store (mask guards the unaligned head);
+    # RMW round: 1 load + 1 store; read-out: 1 load.
+    assert len(_slot_vmi_calls(mod, "vstore", handle)) == 2
+    assert len(_slot_vmi_calls(mod, "vload", handle)) == 2
+    assert not _collect_stores(mod, "local.fragment")
+
+
+
+
+
+@pytest.mark.pto
+def test_unaligned_ub_to_fragment_copy_rejected():
+    """G2: an unaligned fragment destination in a UB-to-fragment copy
+    cannot stay whole-entry without reading past the source — rejected."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((lanes,), "float32"), B: T.Tensor((2 * lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((2 * lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((2 * lanes,), "float32")
+                T.copy(a_ub[0:lanes], keep[lanes // 2 : lanes // 2 + lanes])
+                for i in T.Parallel(2 * lanes):
+                    b_ub[i] = keep[i]
+            T.copy(b_ub, B)
+
+    _, error = _lower_capture(main, "ExpandPtoFragmentFillCopy", expect_error=True)
+    assert error is not None
+    text = str(error)
+    assert "unaligned fragment region" in text, text
+
+
+
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
