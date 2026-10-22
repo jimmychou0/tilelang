@@ -1354,5 +1354,43 @@ def test_kernel_level_loop_fragment_entry_ok():
     assert not _collect_stores(mod, "local.fragment")
 
 
+@pytest.mark.pto
+def test_cross_unit_war_bar():
+    """A1: a unit that only reads the backing followed by a unit that
+    writes it gets a WAR (VLD_VST) bar before the writer, in addition to
+    the writer's trailing VST_VLD."""
+    lanes = 128
+
+    @T.prim_func
+    def main(A: T.Tensor((lanes,), "float32"), B: T.Tensor((lanes,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((lanes,), "float32")
+            b_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((lanes,), "float32")
+                for i in T.Parallel(lanes):
+                    keep[i] = a_ub[i]
+                for i in T.Parallel(lanes):
+                    b_ub[i] = keep[i] + T.float32(1.0)
+                for i in T.Parallel(lanes):
+                    keep[i] = b_ub[i] * T.float32(2.0)
+                for i in T.Parallel(lanes):
+                    b_ub[i] = keep[i]
+            T.copy(b_ub, B)
+
+    mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
+    bars = [str(b) for b in _mem_bars(mod)]
+    assert any("VLD_VST" in b for b in bars), bars
+    # Unit sequence: write(init), read, write(needs WAR before + RAW
+    # after), read. Expected: VST_VLD after init; VLD_VST before the
+    # third; VST_VLD after the third.
+    assert len([b for b in bars if "VLD_VST" in b]) == 1, bars
+    assert len([b for b in bars if "VST_VLD" in b]) == 2, bars
+
+
+
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
