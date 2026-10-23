@@ -92,15 +92,6 @@ public:
     bool is_write = false;
   };
 
-  // PTO-only multi-subscript container: when the opt-in flag is set,
-  // RecordBufferAccess stores every distinct subscript group for a buffer
-  // instead of ICHECKing on structural inequality. The first group also
-  // lands in indice_map_ so SIMT consumers (cost model, fragment
-  // validation, LowerTileOp remapping) see unchanged values.
-  using MultiSubscriptMap =
-      std::unordered_map<Buffer, std::vector<BufferAccessInfo>,
-                         ObjectPtrHash, ObjectPtrEqual>;
-
   using BufferIndiceMap = std::unordered_map<Buffer, BufferAccessInfo,
                                              ObjectPtrHash, ObjectPtrEqual>;
 
@@ -187,14 +178,6 @@ public:
   bool HasReducerUpdates() const { return !reducer_updates_.empty(); }
   // Get the mapping from buffer to access indices + access type.
   const BufferIndiceMap &GetIndiceMap() const { return indice_map_; }
-  // Get the multi-subscript access groups for PTO layout solving.
-  // Empty unless the PTO opt-in flag was set at construction.
-  const MultiSubscriptMap &GetMultiSubscripts() const {
-    return multi_subscripts_;
-  }
-  // Whether this operator was constructed with PTO multi-subscript
-  // collection enabled.
-  bool IsPtoMultiSubscript() const { return pto_multi_subscript_; }
   // Get buffers in the order they first appear in the loop body.
   const std::vector<Buffer> &GetAccessOrder() const { return access_order_; }
   // Get the predicate for a given logical thread index. GPU callers pass the
@@ -287,8 +270,6 @@ private:
   ParallelLoopNestVisitor V;
   // Mapping from buffer to their access indices and access type in the loop.
   BufferIndiceMap indice_map_;
-  // Multi-subscript access groups (PTO only, see MultiSubscriptMap).
-  MultiSubscriptMap multi_subscripts_;
   // Whether PTO multi-subscript collection is enabled for this operator.
   // Stored as a node member so ExpandBindValues (which runs during
   // layout inference, long after construction) uses the same mode.

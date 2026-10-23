@@ -190,6 +190,9 @@ For BuildPredicatedFill(const Buffer &dst, int64_t region_min,
 
 For BuildPredicatedCopy(const Buffer &src, int64_t src_min, const Buffer &dst,
                         int64_t dst_min, int64_t extent, int64_t lanes) {
+  // Cross-dtype copies carry the same implicit conversion MakeSIMTLoop
+  // inserts (copy.cc): a source read casts to the destination dtype
+  // before the store.
   const DataType ity = DataType::Int(32);
   const int64_t delta = dst_min % lanes;
   const int64_t base = dst_min - delta;
@@ -201,9 +204,11 @@ For BuildPredicatedCopy(const Buffer &src, int64_t src_min, const Buffer &dst,
   PrimExpr cond =
       (dst_idx >= IntImm(ity, static_cast<int>(dst_min))) &&
       (dst_idx < IntImm(ity, static_cast<int>(dst_min + extent)));
-  Stmt body = IfThenElse(cond, BufferStore(
-                                   dst, BufferLoad(src, {src_idx}),
-                                   {dst_idx}));
+  PrimExpr value = BufferLoad(src, {src_idx});
+  if (src->dtype != dst->dtype) {
+    value = Cast(dst->dtype, value);
+  }
+  Stmt body = IfThenElse(cond, BufferStore(dst, value, {dst_idx}));
   return For(i, IntImm(ity, 0), IntImm(ity, static_cast<int>(padded)),
              ForKind::kParallel, body);
 }
@@ -302,8 +307,8 @@ private:
     if (min_p == nullptr || extent_p == nullptr) {
       return Stmt();
     }
-    if (*min_p % lanes_ == 0) {
-      return Stmt();  // aligned: plain loop, lane proof admits it
+    if (lanes_ <= 0 || *min_p % lanes_ == 0) {
+      return Stmt();  // aligned (or unknown lanes): plain loop path
     }
     return BuildPredicatedFill(node->dst, *min_p, *extent_p, node->value,
                                lanes_);
@@ -318,9 +323,15 @@ private:
   Stmt TryUnalignedCopy(const CopyNode *node, const std::string &name) {
     const bool dst_frag = node->dst.scope() == "local.fragment";
     const bool src_frag = node->src.scope() == "local.fragment";
+    // Only the FRAGMENT side's alignment gates the expansion: a UB-side
+    // unaligned min is none of this pass's business (MakeSIMTLoop's
+    // plain loop shape carries it; the lane proof only constrains
+    // fragment accesses). The multi-dim early branch rejects only when
+    // the fragment region itself is unaligned.
+    const Array<Range> &frag_range =
+        dst_frag ? node->dst_range : node->src_range;
     if (node->dst_range.size() != 1u || node->src_range.size() != 1u) {
-      if (!AllMinsAligned(node->dst_range) ||
-          (src_frag && !AllMinsAligned(node->src_range))) {
+      if (!AllMinsAligned(frag_range)) {
         RejectUnalignedShape(name, dst_frag ? node->dst : node->src);
       }
       return Stmt();
@@ -331,31 +342,48 @@ private:
     if (dmin_p == nullptr || dext_p == nullptr || smin_p == nullptr) {
       return Stmt();
     }
-    const bool dst_aligned = *dmin_p % lanes_ == 0;
-    const bool src_aligned = !src_frag || *smin_p % lanes_ == 0;
+    // The fragment destination's min drives the whole-entry shift; a UB
+    // destination with an unaligned min is fine (plain store path). A
+    // fragment SOURCE with an unaligned min is only fine when the
+    // destination is the same allocation with a congruent min.
+    const bool dst_needs_align = dst_frag;
+    const bool src_needs_align = src_frag && !dst_frag;
+    const bool dst_aligned =
+        !dst_needs_align || lanes_ <= 0 || *dmin_p % lanes_ == 0;
+    const bool src_aligned =
+        !src_needs_align || lanes_ <= 0 || *smin_p % lanes_ == 0;
     if (dst_aligned && src_aligned) {
       return Stmt();
     }
     if (!dst_frag && !src_frag) {
       return Stmt();  // plain UB copy: not this pass's concern
     }
-    if (dst_frag && src_frag && *dmin_p % lanes_ == *smin_p % lanes_) {
+    if (dst_frag && src_frag && lanes_ > 0 &&
+        *dmin_p % lanes_ == *smin_p % lanes_) {
       return BuildPredicatedCopy(node->src, *smin_p, node->dst, *dmin_p,
                                  *dext_p, lanes_);
     }
+    const Buffer &frag = dst_frag ? node->dst : node->src;
     std::ostringstream oss;
     oss << "[ExpandPtoFragmentFillCopy] " << name
-        << " has an unaligned fragment region (min not a multiple of "
-           "the lane width "
-        << lanes_
+        << " has an unaligned region on fragment buffer `" << frag->name
+        << "` (min not a multiple of the lane width " << lanes_
         << ") that cannot be expanded to whole-entry addressing; align "
-           "the region start to the lane width or copy through an "
-           "intermediate buffer";
+           "the fragment region start to the lane width or copy through "
+           "an intermediate buffer";
     LOG(FATAL) << oss.str();
     return Stmt();
   }
 
   bool AllMinsAligned(const Array<Range> &region) const {
+    if (lanes_ <= 0) {
+      // Handwritten TIR without the tl.simdvf_lanes annotation: the
+      // lane width is unknown, so the alignment question is undefined.
+      // Treat the region as aligned and let the plain MakeSIMTLoop
+      // shape carry it (Verify classifies it downstream) instead of
+      // dividing by zero below.
+      return true;
+    }
     for (const Range &range : region) {
       const int64_t *min_p = as_const_int(range->min);
       if (min_p != nullptr && *min_p % lanes_ != 0) {

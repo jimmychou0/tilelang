@@ -315,7 +315,12 @@ private:
   // (f[b, j]) proves its interval — the region-side walk cannot see
   // them, and Verify bound the same ranges when it accepted the program.
   Stmt VisitStmt_(const ForNode *op) final {
-    if (op->kind == ForKind::kSerial && op->min.as<IntImmNode>() != nullptr &&
+    // Any non-parallel loop with constant bounds contributes its range
+    // (T.unroll included): Verify's kernel-level visitor binds every
+    // non-parallel loop, so Vectorize must mirror that set or a
+    // fragment entry under T.unroll fails the interval proof only on
+    // the Vectorize side with a misleading "can be negative" message.
+    if (op->kind != ForKind::kParallel && op->min.as<IntImmNode>() != nullptr &&
         op->extent.as<IntImmNode>() != nullptr) {
       Map<Var, Range> saved = outer_serial_ranges_;
       outer_serial_ranges_.Set(
@@ -651,8 +656,8 @@ private:
     acc(static_cast<const Stmt &>(unit->body));
     for (const auto &a : acc.accesses) {
       if (!a.is_store || !IsUbScope(a.buf)) {
-        // local.fragment carries are ordered by the slot backing's
-        // per-unit mem_bar and must not be split: a split re-declares the
+        // local.fragment carries go through the slot backing (ordered
+        // by the toolchain's automatic barriers) and must not be split: a split re-declares the
         // region's allocations per part, which would give one backing
         // several merged addresses.
         continue;
@@ -1560,7 +1565,7 @@ private:
       }
       // Fragment buffers follow the same rule as the region-level carry
       // analysis and the vecscope split: their in-shell read-modify-write
-      // is ordered by the slot backing's per-unit mem_bar, and promoting
+      // goes through the slot backing (toolchain-ordered), and promoting
       // them to a carry vreg would both split the slot read/write path and
       // leave the writeback storing a never-written vreg into the
       // fragment through the plain UB path (B2).
@@ -1860,7 +1865,7 @@ private:
       }
       // Fragment buffers never participate in region carry promotion:
       // their value lives in the slot backing and is ordered by the
-      // per-unit mem_bar, not by the carry vreg. Promoting a fragment
+      // backing (toolchain-ordered), not by the carry vreg. Promoting a fragment
       // into a vreg while loads still go through the backing would
       // split the read/write path (B2).
       if (GetRef<Buffer>(a.buf).scope() == "local.fragment") {
@@ -2084,7 +2089,8 @@ private:
       }
       if (const auto *f = s.as<ForNode>()) {
         Map<Var, Range> saved = ranges;
-        if (f->kind == ForKind::kSerial && f->min.as<IntImmNode>() != nullptr &&
+        if (f->kind != ForKind::kParallel &&
+            f->min.as<IntImmNode>() != nullptr &&
             f->extent.as<IntImmNode>() != nullptr) {
           ranges.Set(f->loop_var, Range::FromMinExtent(f->min, f->extent));
         }
@@ -2671,8 +2677,10 @@ private:
   // base and element_offset = entry * L; the declaration address already
   // carries the backing offset, so the access offset must not re-add it.
   // The physical residency (register forwarding vs. actual UB traffic) is
-  // PTOAS's mem-to-value decision; TileLang only owns the reservation and
-  // the ordering (a mem_bar after each backing-writing unit).
+  // PTOAS's mem-to-value decision; TileLang owns the reservation, and
+  // the ordering is the toolchain's via PR307's automatic vecscope
+  // barriers (no TileLang-side mem_bar is emitted; the coverage
+  // envelope of PR307's modeling is the documented toolchain floor).
   // ------------------------------------------------------------------
   const SlotState &RequireSlotState(const Buffer &buffer) {
     auto it = slot_map_.find(buffer);
@@ -3209,7 +3217,8 @@ private:
   // the post-conversion declaration check.
   std::unordered_map<const VarNode *, PtoSlotPlan> handle_plans_;
   // True when the unit being converted wrote to a fragment backing (drives
-  // the ordering mem_bar appended after the unit).
+  // (no TileLang-side mem_bar is emitted; ordering is the
+  // toolchain's).
   bool unit_wrote_backing_ = false;
 
   // Per-unit state.
@@ -3232,7 +3241,8 @@ private:
   // carried buffer's in-shell accesses are rewritten to this local.var
   // vreg buffer, so the loop never round-trips through UB — the
   // round-trip is not order-safe on the current PTOAS (no automatic
-  // mem_bar between the carried vstore and the next iteration's vload).
+  // toolchain barrier between the carried vstore and the next
+  // iteration's vload).
   const BufferStoreNode *carry_seed_ = nullptr;
   const ForNode *carry_loop_ = nullptr;
   tirx::Buffer carry_src_{};

@@ -290,8 +290,33 @@ public:
     }
     parent_[ra] = rb;
     parity_[ra] = relation ^ pa ^ pb;
+    // Migrate any value pinned on the old root: after re-parenting,
+    // Find(x) never returns ra again, so an unmigrated entry would be
+    // silently dropped and the component would look unconstrained
+    // (build-order dependent — the P1-2 determinism bug).
+    auto it = root_value_.find(ra);
+    if (it != root_value_.end()) {
+      int migrated = it->second ^ parity_[ra];
+      auto jt = root_value_.find(rb);
+      if (jt == root_value_.end()) {
+        root_value_[rb] = migrated;
+      } else if (jt->second != migrated) {
+        // Both roots already carry (differing) values: a proven
+        // conflict. Signal through the merged value so the next
+        // AddUnary/Solve observes it instead of silently dropping one.
+        conflicting_ = true;
+      }
+      root_value_.erase(it);
+    }
     return true;
   }
+
+  /*! A pinned value per component root (value of the root variable),
+   * migrated on re-parenting. */
+  std::unordered_map<int, int> root_value_;
+  /*! Set when Unite merged two components that both carried values and
+   * the values disagree; the caller turns it into a rejection. */
+  bool conflicting_ = false;
 
 private:
   std::vector<int> parent_;
@@ -444,16 +469,23 @@ private:
         if (IsFragmentScope(access.buffer) &&
             seen_fragments.insert(access.buffer.get()).second) {
           info.fragments.push_back(access.buffer);
+          accessed_fragments_.insert(access.buffer.get());
         }
       }
       unit_owners_[unit.get()] = info.units.size();
       info.units.push_back(std::move(ui));
     }
     // Allocated-but-unaccessed fragments (floating, B5): they still need
-    // a layout before the engine's step 0 can seed them.
+    // a layout before the engine's step 0 can seed them. Fragments that
+    // are neither accessed nor rank-admissible (rank > 2) would only
+    // produce a rejection for a dead buffer — an unaccessed
+    // higher-rank allocation stays untouched instead of blocking the
+    // whole function; the rank/1D-2D gates below apply to accessed
+    // fragments only.
     for (const Buffer &buffer : block->alloc_buffers) {
       if (IsFragmentScope(buffer) &&
-          seen_fragments.insert(buffer.get()).second) {
+          seen_fragments.insert(buffer.get()).second &&
+          buffer->shape.size() <= 2u) {
         info.fragments.push_back(buffer);
       }
     }
@@ -585,6 +617,9 @@ private:
     std::unordered_map<const VarNode *, const tirx::BufferNode *> by_data;
     for (const RegionInfo &region : regions_) {
       for (const Buffer &buffer : region.fragments) {
+        if (accessed_fragments_.count(buffer.get()) == 0) {
+          continue;  // dead views cannot race; never accessed
+        }
         const VarNode *data = buffer->data.get();
         auto it = by_data.find(data);
         if (it == by_data.end()) {
@@ -608,9 +643,10 @@ private:
         if (!inserted && it->second != r) {
           std::ostringstream oss;
           oss << "fragment buffer `" << buffer->name
-              << "` is used by more than one SIMD_VF region; PTO slot "
-                 "storage requires each fragment to stay inside a single "
-                 "region";
+              << "` is used by more than one SIMD_VF region (first seen "
+                 "in region #" << it->second << ", then in region #" << r
+              << "); PTO slot storage requires each fragment to stay "
+                 "inside a single region";
           Reject(oss.str());
         }
       }
@@ -644,7 +680,25 @@ private:
       int64_t count = 0;
       Fragment canonical = BuildCanonicalLayout(
           buffer, lane_dim, lanes, LaneBounds(lanes), &count);
-      if (!canonical->IsEqual(frag.get())) {
+      // Compare field by field: FragmentNode::IsEqual deliberately
+      // ignores InputShape differences (SIMT reuse), so a
+      // wrong-shape annotation could pass the check here and mislead
+      // the pinned constraint.
+      const bool fields_equal =
+          canonical->InputShape().size() == frag->InputShape().size() &&
+          [&]() {
+            for (size_t d = 0; d < canonical->InputShape().size(); ++d) {
+              if (!arith::Analyzer().CanProveEqual(
+                      canonical->InputShape()[d], frag->InputShape()[d])) {
+                return false;
+              }
+            }
+            return arith::Analyzer().CanProveEqual(
+                       canonical->GetForwardThread(), frag->GetForwardThread()) &&
+                   canonical->GetForwardIndex().size() ==
+                       frag->GetForwardIndex().size();
+          }();
+      if (!fields_equal) {
         std::ostringstream oss;
         oss << "annotated layout for fragment buffer `" << buffer->name
             << "` disagrees with the canonical form for lane dim "
@@ -766,7 +820,9 @@ private:
         Reject(oss.str());
       }
       if (mask == 0b01 || mask == 0b10) {
-        AddUnary(unit_var_.at(unit.loop.get()), mask == 0b01 ? 0 : 1);
+        AddUnary(unit_var_.at(unit.loop.get()), mask == 0b01 ? 0 : 1,
+              "the UB access direction of T.Parallel unit (" +
+                  unit.iv->name_hint + ", " + unit.jv->name_hint + ")");
       }
       for (const auto &[buf_node, lanes_pair] : frag_lane) {
         const int l_inner = lanes_pair.first;
@@ -781,7 +837,10 @@ private:
         if (inner_ok && outer_ok) {
           if (!frag_2d || l_inner == l_outer) {
             if (frag_2d) {
-              AddUnary(fit->second, l_inner);
+              AddUnary(fit->second, l_inner,
+                       "the fragment access of T.Parallel unit (" +
+                           unit.iv->name_hint + ", " + unit.jv->name_hint +
+                           ")");
             }
             continue;
           }
@@ -797,14 +856,24 @@ private:
             Reject(oss.str());
           }
         } else if (inner_ok) {
-          AddUnary(unit_var_.at(unit.loop.get()), 0);
+          AddUnary(unit_var_.at(unit.loop.get()), 0,
+                   "the fragment access of T.Parallel unit (" +
+                       unit.iv->name_hint + ", " + unit.jv->name_hint + ")");
           if (frag_2d) {
-            AddUnary(fit->second, l_inner);
+            AddUnary(fit->second, l_inner,
+                     "the fragment access of T.Parallel unit (" +
+                         unit.iv->name_hint + ", " + unit.jv->name_hint +
+                         ")");
           }
         } else {
-          AddUnary(unit_var_.at(unit.loop.get()), 1);
+          AddUnary(unit_var_.at(unit.loop.get()), 1,
+                   "the fragment access of T.Parallel unit (" +
+                       unit.iv->name_hint + ", " + unit.jv->name_hint + ")");
           if (frag_2d) {
-            AddUnary(fit->second, l_outer);
+            AddUnary(fit->second, l_outer,
+                     "the fragment access of T.Parallel unit (" +
+                         unit.iv->name_hint + ", " + unit.jv->name_hint +
+                         ")");
           }
         }
       }
@@ -812,26 +881,40 @@ private:
       for (const auto &[buf_node, lanes_pair] : frag_lane) {
         auto fit = frag_var_.find(buf_node);
         if (fit != frag_var_.end() && lanes_pair.first >= 0) {
-          AddUnary(fit->second, lanes_pair.first);
+          AddUnary(fit->second, lanes_pair.first,
+                   "the fragment access of the 1D T.Parallel unit (" +
+                       unit.iv->name_hint + ")");
         }
       }
     }
   }
 
-  void AddUnary(int var, int value) {
+  void AddUnary(int var, int value, const std::string &source) {
+    if (dsu_->conflicting_) {
+      std::ostringstream oss;
+      oss << "proven layout conflict: contradictory lane-direction "
+             "constraints reach the same unit/buffer group (conflict "
+             "observed while merging components; last source: "
+          << source << ")";
+      Reject(oss.str());
+    }
     int parity = 0;
     int root = dsu_->Find(var, &parity);
-    auto it = root_value_.find(root);
-    if (it == root_value_.end()) {
-      root_value_[root] = value ^ parity;
+    auto it = dsu_->root_value_.find(root);
+    if (it == dsu_->root_value_.end()) {
+      dsu_->root_value_[root] = value ^ parity;
+      last_unary_source_[root] = source;
       return;
     }
     if (it->second != (value ^ parity)) {
       std::ostringstream oss;
       oss << "proven layout conflict: contradictory lane-direction "
-             "constraints reach the same unit/buffer group (the two "
-             "candidate solutions both violate a pinned or "
-             "direction-forced constraint)";
+             "constraints reach the same unit/buffer group — `"
+          << source << "' disagrees with `"
+          << (last_unary_source_.count(root) != 0
+                  ? last_unary_source_[root]
+                  : std::string("an earlier constraint"))
+          << "' on the same group";
       Reject(oss.str());
     }
   }
@@ -841,8 +924,20 @@ private:
     for (const auto &[buf_node, lane_dim] : pinned_lane_dim_) {
       auto it = frag_var_.find(buf_node);
       if (it != frag_var_.end()) {
-        AddUnary(it->second, lane_dim);
+        AddUnary(it->second, lane_dim,
+                 "the kernel-level layout annotation on `" +
+                     buf_node->name + "'");
       }
+    }
+    // A merge that combined two valued components with disagreeing values
+    // is a proven conflict surfaced through the next AddUnary; if every
+    // unary came before the conflicting merge, surface it here so the
+    // rejection is not lost.
+    if (dsu_->conflicting_) {
+      std::ostringstream oss;
+      oss << "proven layout conflict: merging constraint groups produced "
+             "contradictory lane-direction values";
+      Reject(oss.str());
     }
     // Components without a value: pick by total backing bytes; ties by
     // the source-order-first unit with a free direction taking the
@@ -852,7 +947,7 @@ private:
     for (int v = 0; v < static_cast<int>(vars_.size()); ++v) {
       int parity = 0;
       int root = dsu_->Find(v, &parity);
-      if (root_value_.count(root) != 0) {
+      if (dsu_->root_value_.count(root) != 0) {
         continue;
       }
       int64_t bytes[2] = {0, 0};
@@ -892,7 +987,7 @@ private:
       } else {
         chosen = 0;
       }
-      root_value_[root] = chosen;
+      dsu_->root_value_[root] = chosen;
     }
   }
 
@@ -910,7 +1005,10 @@ private:
           if (it != frag_var_.end()) {
             int parity = 0;
             int root = dsu_->Find(it->second, &parity);
-            lane_dim = root_value_.at(root) ^ parity;
+            ICHECK(dsu_->root_value_.count(root) != 0)
+                << "[PtoFragmentLayout] internal error: component root "
+                   "without a value after Solve";
+            lane_dim = dsu_->root_value_.at(root) ^ parity;
           } else {
             // Unconstrained 2D fragment (floating): byte-minimal lane
             // dim, ties on the last dim (the inner preference).
@@ -1005,10 +1103,13 @@ private:
   std::unordered_map<const tirx::BufferNode *, int> frag_var_;
   std::unordered_map<const tirx::BufferNode *, int> pinned_lane_dim_;
   std::unordered_map<const tirx::BufferNode *, int64_t> frag_lanes_;
+  /*! Fragment buffers with at least one recorded access (rank gates and
+   * the same-data check consider only these). */
+  std::unordered_set<const tirx::BufferNode *> accessed_fragments_;
   std::unordered_map<const ForNode *, size_t> unit_owners_;
   std::unordered_map<const SBlockNode *, int> region_index_of_;
   std::unique_ptr<ParityDSU> dsu_;
-  std::unordered_map<int, int> root_value_;
+  std::unordered_map<int, std::string> last_unary_source_;
   std::vector<RegionInfo> regions_;
   const LayoutMap &annotated_;
 };

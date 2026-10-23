@@ -5599,9 +5599,14 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
       continue;
     }
     // dist_mode no longer exists in PTODSL (removed by PTOAS!293); every
-    // form is composed at emission (see the vload/vstore branches below),
-    // and "continuous" is the default load behavior.
-    if (key_str == "dist_mode" && op_name == "tl.vmi.vload") {
+    // form is composed at emission (see the vload/vstore branches above),
+    // and "continuous" is the default load and store behavior.
+    const bool dist_mode_is_continuous =
+        key_str == "dist_mode" && value.as<StringImmNode>() != nullptr &&
+        Downcast<StringImm>(value)->value == "continuous";
+    if (key_str == "dist_mode" &&
+        (op_name == "tl.vmi.vload" ||
+         (op_name == "tl.vmi.vstore" && dist_mode_is_continuous))) {
       continue;
     }
     kwargs.emplace_back(std::move(key_str), value);
@@ -5695,12 +5700,33 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
   };
   if (op_name == "tl.vmi.vload" || op_name == "tl.vmi.vstore") {
     const std::string dist_mode = VmiDistModeOf_(op);
+    const bool has_group =
+        op->annotations.find("group") != op->annotations.end();
     if (op_name == "tl.vmi.vload" && dist_mode == "brc") {
-      // A broadcast load is a one-element load followed by vbrc.
+      // A broadcast load is a load of the source elements followed by
+      // vbrc. Without group that is one element; with group it is
+      // `group` elements loaded at `stride` (the frontend only allows
+      // group+brc with stride), each broadcast to size/group lanes —
+      // PTODSL vbrc's group= parameter carries the grouping.
       ICHECK_EQ(op->args.size(), 2U) << "tl.vmi.vload expects (ptr, offset)";
+      int64_t load_size = 1;
+      std::string stride_arg;
+      std::string group_arg;
+      if (has_group) {
+        const auto *group = op->annotations.at("group").as<IntImmNode>();
+        ICHECK(group != nullptr && group->value > 0)
+            << "tl.vmi.vload group annotation must be a positive constant";
+        load_size = group->value;
+        group_arg = ", group=" + std::to_string(group->value);
+        const auto *stride =
+            op->annotations.at("stride").as<IntImmNode>();
+        ICHECK(stride != nullptr)
+            << "tl.vmi.vload stride annotation must be a constant";
+        stride_arg = ", stride=" + std::to_string(stride->value);
+      }
       os << "pto.vmi.vbrc(pto.vmi.vload(" << pto_source(op->args[0]) << ", "
-         << pto_offset(op->args[1]) << ", size=1), size=" << VmiSizeOf_(op)
-         << ")";
+         << pto_offset(op->args[1]) << ", size=" << load_size << stride_arg
+         << "), size=" << VmiSizeOf_(op) << group_arg << ")";
       return;
     }
     if (op_name == "tl.vmi.vload" && dist_mode == "dintlv") {
@@ -5720,13 +5746,18 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
     if (op_name == "tl.vmi.vstore" && dist_mode == "dintlv") {
       // An interleaved store is vintlv followed by two contiguous
       // stores, emitted as one statement sequence (vintlv's result is
-      // an indexable pair).
-      ICHECK_GE(op->args.size(), 5U)
+      // an indexable pair). The mask is optional (base accepts a
+      // maskless vstore); without one, both halves use the full mask.
+      ICHECK_GE(op->args.size(), 4U)
           << "tl.vmi.vstore with dist_mode=dintlv expects (even, odd, ptr, "
-             "offset, mask)";
+             "offset[, mask])";
       const int64_t size = op->args[0].dtype().lanes();
       const std::string off = pto_offset(op->args[3]);
-      const std::string mask = PrintExpr_(op->args[4]);
+      const std::string mask =
+          op->args.size() >= 5
+              ? PrintExpr_(op->args[4])
+              : "pto.vmi.create_mask(" + std::to_string(size) +
+                    ", size=" + std::to_string(size) + ")";
       os << "_di = pto.vmi.vintlv(" << PrintExpr_(op->args[0]) << ", "
          << PrintExpr_(op->args[1]) << ", " << mask << "); ";
       os << "pto.vmi.vstore(_di[0], " << pto_source(op->args[2]) << ", "

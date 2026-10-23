@@ -4,11 +4,10 @@ These kernels keep a ``T.alloc_fragment`` buffer across sequential
 ``T.Parallel`` units inside ``T.SimdVF``: VectorizeParallelToPTO converts the
 fragment accesses into ordinary ``vload``/``vstore`` on an exclusively
 reserved unified-buffer backing (entry q at element offset q*lanes, chunk
-mask on stores) and orders each backing-writing unit with a vecscope
-``mem_bar("VST_VLD")``. The mem-to-value promotion (PTOAS MR 274) may then
-forward the store->load round trips into registers; without it the round
-trips execute through the backing and the mem_bar keeps them ordered, so
-numerics must hold on either toolchain.
+mask on stores). No TileLang-side mem_bar is emitted: ordering of backing
+accesses relies on the toolchain's automatic vecscope barriers (PR307) and,
+where it applies, the mem-to-value forwarding (PTOAS MR 274). The device
+numerics below pin that reliance for every shape in this suite.
 """
 
 import os
@@ -73,8 +72,7 @@ def _assert_backing_source():
             "fragment storage must be declared through pto.memref_declare"
         )
         assert "with pto.vecscope():" in source
-        # No TileLang-side mem_bar: backing ordering (cross-unit RAW/WAR
-        # and in-shell cross-iteration RAW) is delegated to the
+        # No TileLang-side mem_bar: backing ordering is delegated to the
         # toolchain's automatic vecscope barriers (PR307).
 
     return check
@@ -361,6 +359,55 @@ def _shell_accumulator(K, lanes):
     return main
 
 
+def _entry_shift_add(E, lanes):
+    """out-of-place entry-shifted read: out[j] = keep[j] + keep[j+VL]
+    for j in [0, VL) — the shifted entry stays inside the fragment."""
+
+    @T.prim_func
+    def main(
+        A: T.Buffer((E,), "float32"),
+        Out: T.Buffer((lanes,), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((E,), "float32")
+            out_ub = T.alloc_shared((lanes,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((E,), "float32")
+                for i in T.Parallel(E):
+                    keep[i] = a_ub[i]
+                for j in T.Parallel(lanes):
+                    out_ub[j] = keep[j] + keep[j + lanes]
+            T.copy(out_ub, Out)
+
+    return main
+
+
+def _disjoint_self_copy(E, lanes):
+    """A disjoint self-copy inside the fragment (entry 2 -> entry 0),
+    then a full read: the copied lanes must carry the source values."""
+
+    @T.prim_func
+    def main(
+        A: T.Buffer((E,), "float32"),
+        Out: T.Buffer((E,), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((E,), "float32")
+            out_ub = T.alloc_shared((E,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=lanes):
+                keep = T.alloc_fragment((E,), "float32")
+                for i in T.Parallel(E):
+                    keep[i] = a_ub[i]
+                T.copy(keep[2 * lanes : 3 * lanes], keep[0:lanes])
+                for i in T.Parallel(E):
+                    out_ub[i] = keep[i]
+            T.copy(out_ub, Out)
+
+    return main
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -487,6 +534,8 @@ def test_unaligned_fill_numeric(npu, lanes):
 def test_multi_chunk_ragged_numeric(npu, lanes):
     M, N = 4, 2 * lanes + 8  # three entries per row, 8-lane ragged tail
     a = torch.randn(M * N)
+    # Entry count pins the layout: ceil(N/VL)=3 chunks per row * M rows.
+    assert (N + lanes - 1) // lanes * M == 3 * M
     _run_and_check(
         _multi_chunk_ragged(M, N, lanes),
         (a.to(npu),),
@@ -507,6 +556,34 @@ def test_shell_accumulator_numeric(npu, lanes):
         expected,
         source_checks=_assert_backing_source(),
         atol=1e-3,
+    )
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("lanes", [128])
+def test_entry_shift_add_numeric(npu, lanes):
+    E = 2 * lanes
+    a = torch.randn(E)
+    _run_and_check(
+        _entry_shift_add(E, lanes),
+        (a.to(npu),),
+        a[:lanes] + a[lanes:],
+        source_checks=_assert_backing_source(),
+    )
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("lanes", [128])
+def test_disjoint_self_copy_numeric(npu, lanes):
+    E = 4 * lanes
+    a = torch.randn(E)
+    expected = a.clone()
+    expected[:lanes] = a[2 * lanes : 3 * lanes]
+    _run_and_check(
+        _disjoint_self_copy(E, lanes),
+        (a.to(npu),),
+        expected,
+        source_checks=_assert_backing_source(),
     )
 
 

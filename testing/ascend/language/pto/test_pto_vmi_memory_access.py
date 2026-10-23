@@ -535,6 +535,14 @@ def test_group_slot_and_broadcast_use_one_element_per_group():
             T.copy(work, C)
 
     assert _vload_descriptor(group_brc) == (64, 129, 1, 0)
+    # PTODSL removed dist_mode; the grouped broadcast composes as a
+    # stride-`group` load of `group` elements plus vbrc(group=), which
+    # carries the grouping (lanes of each group element broadcast to
+    # size/group lanes — not a single element to all lanes).
+    artifact = _lower_pto(group_brc)
+    assert 'dist_mode' not in artifact.kernel_source
+    assert "pto.vmi.vbrc(pto.vmi.vload(" in artifact.kernel_source
+    assert "group=2" in artifact.kernel_source
 
 
 def test_group_static_negative_stride_relocates_lowest_address():

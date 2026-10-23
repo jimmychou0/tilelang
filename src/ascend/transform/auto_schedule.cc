@@ -941,8 +941,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
         LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
                    << "\" capacity " << capacity
                    << " is insufficient for minimum buffer usage " << min_usage
-                   << "; reduce buffer sizes (raising the limit only "
-                      "defers the failure to the final capacity check)";
+                   << ". Try using T.annotate_unlimit_memory(\""
+                   << group_scopes[g] << "\") or reduce buffer sizes.";
       }
     }
   }

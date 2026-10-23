@@ -182,8 +182,11 @@ def _merged_total(mod) -> int:
 
 
 def _ping_pong_rounds(rounds: int, lanes: int = 128):
-    """One fragment kept across many sequential RMW rounds (ping/pong):
-    the backing must stay a single allocation regardless of the round
+    """One fragment kept across many sequential RMW rounds inside one
+    region (source-level sharing across separate SIMD_VF blocks is
+    rejected by the pre-scan — see the structure suite — while the
+    vecscope split creates the multi-region form internally): the
+    backing must stay a single allocation regardless of the round
     count."""
 
     @T.prim_func
@@ -196,7 +199,7 @@ def _ping_pong_rounds(rounds: int, lanes: int = 128):
                 keep = T.alloc_fragment((lanes,), "float32")
                 for i in T.Parallel(lanes):
                     keep[i] = a_ub[i]
-                for _r in range(rounds):
+                for _r in T.serial(rounds):
                     for i in T.Parallel(lanes):
                         keep[i] = keep[i] * T.float32(1.01)
                 for i in T.Parallel(lanes):
@@ -269,6 +272,7 @@ def test_backing_intervals_disjoint_auto_path():
     mod = _lower_capture(_two_fragments_with_preceding_ub(), "VerifyPTOCodegenLegality")
     ranges = _declared_backing_ranges(mod)
     assert len(ranges) >= 2, f"expected the two backings' declarations, got {ranges}"
+    total = _merged_total(mod)
     for a in range(len(ranges)):
         for b in range(a + 1, len(ranges)):
             (off_a, size_a), (off_b, size_b) = ranges[a], ranges[b]
@@ -276,6 +280,10 @@ def test_backing_intervals_disjoint_auto_path():
             assert not overlap, (
                 f"backing byte ranges overlap: {ranges[a]} vs {ranges[b]}"
             )
+    for off, size in ranges:
+        assert 0 <= off and off + size <= total, (
+            f"backing [{off}, {off + size}) escapes the merged arena [0, {total})"
+        )
 
 
 @pytest.mark.pto
@@ -308,8 +316,10 @@ def test_backing_base_nonzero_after_preceding_ub():
 @pytest.mark.pto
 def test_reservation_fits_merged_budget():
     """The merged total (reservation + ordinary buffers) stays within the
-    physical unified buffer (216 KiB with a SIMT_VF context; the kernels
-    here convert so the vecscope context applies)."""
+    physical unified buffer. The ceiling used here (248 KiB, no SIMT_VF
+    thread context) matches the merge-side final check's most permissive
+    arm; kernels this small are far from it, so the assertion mainly
+    pins that the arena exists and is finite, not a tight budget."""
     mod = _lower_capture(_two_fragments_with_preceding_ub(), "VerifyPTOCodegenLegality")
     total = _merged_total(mod)
     assert 0 < total <= 216 * 1024, (

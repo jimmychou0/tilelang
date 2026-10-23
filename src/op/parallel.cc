@@ -271,36 +271,16 @@ void ParallelOpNode::RecordBufferAccess(const Buffer &buffer,
   // that make each group independently safe. A non-fragment buffer with
   // differing subscripts keeps the strict structural-equality ICHECK —
   // the layout engine still consumes the single first group only.
-  if (pto_multi_subscript_ && buffer.scope() == "local.fragment") {
-    // Record every distinct subscript group. The first group also
-    // populates indice_map_ so SIMT consumers (cost model, fragment
-    // validation, LowerTileOp remapping) see unchanged values.
-    auto &groups = multi_subscripts_[buffer];
-    bool found = false;
-    for (auto &g : groups) {
-      if (StructuralEqual()(g.indices, indices)) {
-        if (is_write) {
-          g.is_write = true;
-        } else {
-          g.is_read = true;
-        }
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      BufferAccessInfo info;
-      info.indices = indices;
-      info.is_write = is_write;
-      info.is_read = !is_write;
-      groups.push_back(std::move(info));
-    }
-  }
+  // In PTO multi-subscript mode a local.fragment buffer accepts every
+  // distinct subscript group (first group wins in indice_map_); all
+  // other buffers keep the strict structural-equality check. The
+  // downstream consumer of the groups is the layout solver's own access
+  // scanner, which records every textual access independently.
+  const bool relaxed =
+      pto_multi_subscript_ && buffer.scope() == "local.fragment";
   auto it = indice_map_.find(buffer);
   if (it != indice_map_.end()) {
-    if (pto_multi_subscript_ && buffer.scope() == "local.fragment") {
-      // First group wins (recorded above); only the access kind widens.
-    } else {
+    if (!relaxed) {
       ICHECK(StructuralEqual()(it->second.indices, indices))
           << buffer << ": " << indices << " and " << it->second.indices
           << SpanHintSuffix(buffer->span);

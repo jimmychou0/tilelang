@@ -495,8 +495,14 @@ Stmt MergeUBAllocations(Stmt stmt, int align_bytes, bool verbose,
                         bool disable_reuse) {
   BufferAliasContractExtractor extractor;
   stmt = extractor.Extract(stmt);
-  if (!extractor.FoundContract())
+  if (!extractor.FoundContract()) {
+    // The no-contract path returns before any merging, but a slot
+    // kernel without a buffer-alias contract still owes its final
+    // capacity check (D4's exclusivity floor) — run it on the
+    // un-merged body so early exit does not skip it.
+    CheckPtoSlotUnifiedBufferCapacity(stmt);
     return stmt;
+  }
   BufferAliasMap aliases = extractor.Aliases();
   ValidateBufferAliasMap(aliases);
 

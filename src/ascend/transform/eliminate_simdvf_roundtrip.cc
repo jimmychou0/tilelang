@@ -9,8 +9,11 @@
  * A "round trip" is a region-local buffer that only shuttles a value through
  * UB inside one SIMD_VF region: unit A stores it, a later unit loads it back.
  * After VectorizeParallelToPTO such a buffer becomes a vstore followed by a
- * vload in the same vecscope, and the machine-level schedule does not honour
- * that UB RAW (the load may observe the previous UB contents). The value
+ * vload in the same vecscope. Eliminating the round trip at the TileLang
+ * level keeps the value out of memory entirely (a zero-cost ordering);
+ * relying on the toolchain's automatic barriers for it would leave both the
+ * traffic and the barrier in place, and for shapes outside the toolchain's
+ * modeling envelope there would be no ordering at all. The value
  * never needed UB in the first place, so this pass removes the buffer while
  * the IR is still scalar parallel TIR, which keeps the vectorizer (and VMI)
  * unchanged.
