@@ -1,22 +1,22 @@
 # TileLang Parallel 到 PTO：PR-4 Fragment/slot 存储详细设计
 
-> **当前状态（2026-10-23，十五轮后；历史评审轮次细节见《PR4 设计评审历程归档》）**
+> **当前状态（2026-10-23，P1-1 定案 + 状态同步；历史评审轮次细节见《PR4 设计评审历程归档》）**
 >
-> **分支**：`zjm/pto-slot-clean`（PR jimmychou0/tilelang#2，base `pto-tparallel-control-flow`@`bc715beb` 之上 18 提交；HEAD `21a4d976`）。
+> **分支**：`zjm/pto-slot-clean`（PR jimmychou0/tilelang#2，base `pto-tparallel-control-flow`@`bc715beb` 之上 18 个代码提交 + docs 提交；代码 HEAD `21a4d976`，docs 汇编 `da92eea3`、状态同步为本提交）。
 >
 > **已落地**（按设计章节）：Fragment/slot 存储全链路——布局联合求解器（R4 重写合入：前扫描 A2/同 data/跨区域/注解/TileOp 拒绝、奇偶求解、字节最小定解 + 源码序破并列、注入为既定事实，B1/B4/B5 关闭）、PlanPtoSlotStorage + AutoSchedule 预算扣减 + Merge 容量终检（含 no-contract 路径）+ 逐 backing 字节区间不相交两调度路径断言（D2/D3 关闭）、Vectorize handle 化转换（declare_fragment_buffer + vload/vstore、整除粒度证明、kernel 作用域清理、predicate 声明收集，D5/D7 关闭）、G2 fill/copy 展开（未对齐 1D 谓词化、**fragment 侧门控**、跨 dtype Cast、重叠/同 data 拒绝）、G3 谓词合成（base Legalize）、A4 双侧区间证明（区域级/kernel 级/split 提升循环范围两侧同集）、J3 组合发射（brc 含 group、dintlv 两连读+vdintlv、intlv 写 vintlv+两连写、continuous 静默、无 mask 合成全真 mask）、Q4 投影拒绝、U3 单 root 断言、A6 分类诊断、诊断批。**确定性**（R4 §3.9/3.10）：DSU 约束迁移修复 + 冲突来源 + 逐值断言用例。
 >
-> **保序（G4/A1，当前口径——待 P1-1 决策更新）**：TileLang 侧保守 mem_bar 已全部移除，backing 访问保序依赖 PR307 自动 vecscope bar；**已知风险**（评审 P1-1）：PR307 对 >2 层循环嵌套与 offset 依赖 vecscope 外变量的形态只记 Unknown 不插 bar，而本 PR 新增的 k×multi-chunk 2D、kernel 级 `f[b,j]`、split `f[t,i]` 恰好命中；现有设备全绿是幸存者偏差（测试用例都在建模包络内，shell 累加器 offset=0 可能被 mem-to-value 直接转发）。**修复方案待定**（区域门控 vs 全量恢复 vs 拒绝），定案后本节与 §6 决策表同步。
+> **保序（G4/A1，P1-1 已定案 2026-10-22）**：TileLang 侧保守 mem_bar 维持全部移除（不恢复、不加区域门控、不拒绝形态）——本侧原则是不自行插 bar，backing 访问保序整体委托 PR307 自动 vecscope bar。**已证覆盖缺口**（评审 P1-1，最小复现 A/A′/B）：PR307 对 >2 层 IV 嵌套只保 3 条必需边中的 1 条、对 offset 依赖 vecscope 外变量的形态 0 条（对照 2-IV 形态 3 条齐全），且 `unknownDependences` 只写不读、完全静默。**已提 [hw-native-sys/PTOAS#1679](https://github.com/hw-native-sys/PTOAS/issues/1679)**（三类最小复现 + IR 证据 + 源码定位 `VecScopeMemBarAnalysis.cpp:546`/`VecScopeMemoryFootprint.cpp:259`/`:334` + 修复诉求），修复跟踪在 PTOAS 侧；修复落地前该三类形态（k×multi-chunk 2D、kernel 级 `f[b,j]`、split `f[t,i]`）在 IR 层面无保序契约（设备数值当前正确属时序巧合）。工具链下限不变。
 >
 > **工具链下限**（唯一口径）：PTOAS master ≥ `d30269595`（0.69，PR307 已上游）+ MR274 补丁（memref/mem-to-value，未上游）；CANN 编译器 ≥ weekly-0909 系（fmaximum 标量选择）；MR274 合入后收敛为纯 master。
 >
-> **验证（2026-10-23，238，干净构建）**：结构 48/48（含求解器确定性/注解 pinned/unroll/死缓冲容忍/UB 多下标/U3 双 kernel）；全 pto 目录（设备含）上轮 628/628（本轮修复后全量复验在跑）；中间提交 4e649c5b/aeb9a140/bdb70e3c 的逐提交验证待跑。
+> **验证（2026-10-23，238，PTOAS master `d30269595` + MR274，干净构建）**：结构套件 **81/81**（干净重建后）；全 pto 目录（设备含）**636/636**（推送前树相同代码状态取得；其后仅 docs 提交，结果不受影响。推送当日 238 设备被他人占用，最终树复跑属环境项）；三个点名中间提交 `4e649c5b`/`aeb9a140`/`bdb70e3c` 逐提交编译 + 结构套件**均通过**。
 >
 > **明确不属本 PR**（按裁定）：shell 累加器 vreg 化（m2 归 PTOAS mem-to-value 动态 offset 转发）、单元素提取（m2 §8.6）、2D 未对齐 fill/copy、投影改写 plan（base 机制）、广播布局与 finalize pinned（PR-6）。
 >
 > **登记的形态差异**（非功能缺口）：非规范注解报引擎内部 Check；SimdVF 级注解经冲突路径 fail-closed；A6/预算 LOG(FATAL) 形态；同 data 视图防御路径（DSL 不可构造）；M9 等价偏差（求解器自带同语义扫描器；注入即跳过重提议）。
 >
-> **PTOAS 问题清单（当前有效项）**：①fmaximum 标量 max 在 CANN GA 上无选择（weekly-0909 已修，声明版本下限即关闭）；②mem-to-value 动态 offset 转发（性能增强）；③PR307 对三类形态的覆盖保证确认（形式确认，设备已实证建模包络内）；④MR274 合入计划；⑤跨 vecscope 保序语义（连续 vecscope 间无同步指令——源码证据已取，需设备 A/B + 答复）。
+> **PTOAS 问题清单（当前有效项）**：①fmaximum 标量 max 在 CANN GA 上无选择（weekly-0909 已修，声明版本下限即关闭）；②mem-to-value 动态 offset 转发（性能增强）；③~~PR307 覆盖保证确认~~ **已升级为正式 issue [#1679](https://github.com/hw-native-sys/PTOAS/issues/1679)**（2026-10-23 提交：>2 层 IV 嵌套 / vecscope 外变量 offset 两类失守 + unknownDependences 静默，最小复现 A/A′/B 的 bar 计数 1/3/0，附源码定位与修复诉求，待答复）；④MR274 合入计划；⑤跨 vecscope 保序语义（连续 vecscope 间无同步指令——源码证据已取，需设备 A/B + 答复）。
 
 ## 1. 概述
 
@@ -370,10 +370,10 @@ PTO 路径在 `InferLayout` 早退分支跳过 `ValidateCandidateAgainstFragment
 | fill/copy 布局推导前展开为 T.Parallel 复用既有单元转换，不在 Vectorize 内做专用 lowering（**仅起点按 VL 对齐**） | 对齐子区间的 region 语义由循环形态天然承载（min/extent 迭代、源/目的独立映射、chunk mask 收敛部分覆盖）；fill/copy 调用不进调度；展开后与手写 Parallel 走完全相同的推导/准入/发射链。未对齐起点与重叠自拷贝的检查定在 `ExpandPtoFragmentFillCopy`（展开时源/目的区间均已知；前扫描只见展开后的 Parallel 单元、无法做跨逻辑点依赖分析，m2 §5.2 明确不做） |
 | 每区域一次全新同名 handle Var（plan 预建 Var 只作命名/身份） | vecscope 分裂使一个 plan 对应多个区域，各部分必须各自声明；同一 Var Bind 两次会触犯 SSA 单定义（codegen 有重复定义检查） |
 | vload 不做 CSE（DCE 白名单含 vload：无人消费的读会被删除，语义无害——见 §5.6-3 勘误） | 内存语义；合并/消除是 PTOAS 职权；两次读保留两次 vload 是验收要求（前提是两次读的结果均被使用） |
-| （保序口径见 §6 决策表——当前无 TileLang 侧 bar，P1-1 决策可能恢复部分形态） | **覆盖矩阵（登记 A1）**：该 bar 只保护跨单元 RAW；单元内 store→load 同 entry、跨单元 WAR（需 VLD_VST）无 TileLang 侧保护；PR307 自动插 bar 对 Unknown 依赖只记录不插、且 mem-to-value 仅转发常量 offset（动态 entry 的 bar 不会被转发删除）——故保守 bar 保留为默认，移除决策待 Unknown 形态用例补验 |
+| 保序（A1，P1-1 定案 2026-10-22）：TileLang 侧不插 bar，全部委托 PR307 自动 vecscope bar（不恢复、不门控、不拒绝形态） | 本侧原则是 vecscope 内保序不归前端；已证 PR307 覆盖缺口（3-IV 嵌套缺 2/3 条边、外变量 offset 0 条、Unknown 静默）作为 PTOAS 缺陷跟踪（[#1679](https://github.com/hw-native-sys/PTOAS/issues/1679)，最小复现 A/A′/B）；修复落地前三类形态无 IR 层保序契约（设备数值当前正确属 V 管时序巧合）；工具链下限 = master 0.69 + MR274 lineage 不变 |
 | 声明的 Bind 在 `tl.simdvf_scope` 之内 | VPTO 将 vecscope 数据视为 region-local，跨界引用被拒 |
 | `declare_fragment_buffer` 的 backing 操作数用 `tl.access_ptr` 表达而非旁表名字 | 地址 pass 只能改写 IR 中的地址表达 |
-| carry/vecscope-split 检测限 UB scope（split 侧、region carry 侧、单元 shell 侧三处均已排除 fragment，B2 关闭） | fragment carry 走分裂/晋升改变保序结构；现由 slot 路径 + mem_bar 保序 |
+| carry/vecscope-split 检测限 UB scope（split 侧、region carry 侧、单元 shell 侧三处均已排除 fragment，B2 关闭） | fragment carry 走分裂/晋升改变保序结构；现由 slot 路径 + 工具链自动 vecscope bar（PR307）保序 |
 
 ## 7. 测试与验收计划
 
@@ -396,7 +396,7 @@ PTO 路径在 `InferLayout` 早退分支跳过 `ValidateCandidateAgainstFragment
   - 1× `test_scalar_float_cast_rejected_by_device_compiler`：负例期望的 VPTO 报错文案未出现——MR274 系 ptoas 对该源返回 0 但不产出 fatobj（静默无产物），报错面错配；该用例此前从未进入历史回归子集，非本次回归。
 - **gym 数值矩阵（合并栈，rebase 后）：9/9 全部 PASS**——sv1、sv3v×2、cf1v–cf6v；原 J1（base vecscope 分裂地址断裂）已被 base 修复（split 分配提升 + carry 决策对齐，现在新基线中的 `d1a2e96f` + `1e2cdfa6`），J1 关闭。**另 sv2v 编译+数值通过**（base 的 per-lane alloc_var 提升（新基线 `4c70bec7`） 解锁）——simd-pto 验收面 15 家族中 **10 个数值通过**；剩余 5 个拒绝均有明确归属：sv5v/sv8v（local.var 数组累加器，PR-2 路线）、sv9v（PR-3 直接规约）、sv4v（PR-5 gather）、sv6v/sv7v（J2/J4 工具链）。
 - **sv9v 重估**：G2 移除了 fragment-copy 屏障；三个 arm 现统一拒绝于 `T.reduce_max/min` 直接规约——干净的 PR-3 依赖，符合路线图。
-- **G4 实验**：临时移除 TileLang 侧 slot mem_bar 后 slot 套件仍 **13/13 通过**。**证据面限定（A1）**：该实验覆盖的是仿射地址、常量界、两层以内循环形态的跨单元 RAW；PR307 对 Unknown 依赖只记录不插 bar，单元内 RAW 与跨单元 WAR 未验证——"自动插 bar 完全覆盖"的结论以此为准，保守基线已恢复并复验（13/13）。
+- **G4 实验**：临时移除 TileLang 侧 slot mem_bar 后 slot 套件仍 **13/13 通过**。**证据面限定（A1）**：该实验覆盖的是仿射地址、常量界、两层以内循环形态的跨单元 RAW；PR307 对 Unknown 依赖只记录不插 bar，单元内 RAW 与跨单元 WAR 未验证——"自动插 bar 完全覆盖"的结论以此为准。**后续（十二轮 + P1-1 定案）**：bar 移除转为正式口径（上述保守基线不再恢复），覆盖缺口以 PTOAS [#1679](https://github.com/hw-native-sys/PTOAS/issues/1679) 跟踪（最小复现 A/A′/B：2-IV 对照 3 条 bar 齐全、3-IV 仅 1 条、外变量 offset 0 条）。
 - 历史基线（换形前 backing 直址形态）：144 结构 7 套件 69/70；238 设备全量 143/143（文件子集）；vmi-0.1.9 与 MR274 双栈全绿。G1 后工具链下限为 MR274+（memref_declare）。
 
 ### 7.4 兼容性
@@ -421,20 +421,20 @@ AscendC 注解集不变；PTO SIMT、手写 VMI 区域照旧跳过；存量 kern
 | B4 | 崩溃 | fragment 的同单元不同下标在收集阶段 ICHECK 崩溃（`f[i]=f[i]+f[i+VL]`、自拷贝 `f[i+128]=f[i]`——原地写法仅 extent≤VL 是合法并行程序，测试一律 out-of-place）。**终审更正**：登记时的 UB 形态 `B[j]+B[j+VL]` 从未受影响——收集 visitor 只记录 fragment，UB 不进 ICHECK 路径，实测完整跑通 | ✅ 已关闭（多下标收集，**限 local.fragment**——UB 本就不需收集；非 fragment 保持严格 ICHECK） |
 | B5 | 崩溃 | floating fragment 被 step 0 种成 SIMT FullyReplicated 后与 PTO 提议在合并点冲突 → layout_inference.cc:482 裸 FATAL | ✅ 已关闭（求解器为 floating fragment 前置产出字节最小布局，step 0 跳过已布局缓冲；正例入套件） |
 | A6 | Plan 缺口 | Plan 只查 forward_index 维数即用 OutputShape()[0] 算 count，不校验规范形态；注解/floating 布局进入会算错预留量 | ✅ 已关闭（replicate==1 + 常量正 thread extent 断言；报错仍为 ICHECK 形态，分类化登记为后续小项） |
-| U1 | 预算时点 | 预算只在 kernel 含调度循环时才约束多缓冲版本选择（memory_limits_ 仅在 `Z3SchedulePythonLoop` 内使用）；直线任务列表没有版本选择决策，预算本来就没有可约束的对象——**物理容量始终由 Merge 终检保证**（base :921 注释同此立场）。剩余问题是 Merge 阶段才发现超限且报 ICHECK、以及无 contract 时终检跳过 | ⚠ 并入 U5/R3：改用户错误形态、保无 contract 路径终检（**原 P1 升门槛已降为 P2**——直线 kernel 无决策可约束，非有效性缺陷） |
+| U1 | 预算时点 | 预算只在 kernel 含调度循环时才约束多缓冲版本选择（memory_limits_ 仅在 `Z3SchedulePythonLoop` 内使用）；直线任务列表没有版本选择决策，预算本来就没有可约束的对象——**物理容量始终由 Merge 终检保证**（base :921 注释同此立场）。剩余问题是 Merge 阶段才发现超限且报 ICHECK | ⚠ 并入 U5/R3：改用户错误形态（**原 P1 升门槛已降为 P2**——直线 kernel 无决策可约束，非有效性缺陷）。~~无 contract 时终检跳过~~已关闭（`merge_ub_allocations.cc:499` no-contract 路径跑容量终检，随十五轮修复落地） |
 | U3 | 预算口径 | 多 kernel root 时预算与终检口径不同 | ✅ 单 root 断言 + 负例用例；按 root 分组校验维持登记 |
 | U2 | 预算口径 | 预算不含对齐 padding、最终布局含（差额上界 31N/分配；当前准入面内对 backing 恒为无操作但未触发过用例） | ⚠ 随 U1 一并处理 |
 | U4 | 诊断错配 | B1→entry 32× 膨胀→预留失败，报错面（容量不足）与根因（布局取向）错配 | ✅ 已关闭（求解器两解取小，膨胀布局不再产生） |
 | U5 | 诊断形态 | 预留超限报文 | ✅ slot 预算报文已改分类形态（去 unlimit 建议）；Z3 通用报文保留 base 建议（波及非 PTO 用户属回归，已还原）；LOG(FATAL) 形态归登记 |
 | U6 | 校验口径 | HasSimtVF 探测器双份（Merge 后块名仍在，按名匹配成立——降级） | 🔧 整洁性：两侧共用 helper |
-| A1 | 同步（十二轮决策） | **TileLang 侧保守 mem_bar 已全部移除**（单元级/WAR/shell 迭代）：backing 访问保序整体移交 PR307 自动 vecscope bar；工具链下限 = `pr274-pr307-merge` lineage（PR307 对建模依赖自动插 bar；Unknown 形态的覆盖请求已列入 PTOAS 问题清单）；shell 累加器无 bar 设备数值为委派的直接证据 | ✅ 责任移交（G4 按 m2 §9.5 的原始划界落地）；PR307 Unknown 形态与 mem-to-value 动态 offset 转发为 PTOAS 侧请求 |
+| A1 | 同步（十二轮决策；**P1-1 定案 2026-10-22**） | **TileLang 侧保守 mem_bar 维持全部移除**（单元级/WAR/shell 迭代）：backing 访问保序整体委托 PR307 自动 vecscope bar，不在本侧恢复/门控/拒绝；工具链下限 = master 0.69 + MR274 lineage。**已证覆盖缺口**（3-IV 嵌套、vecscope 外变量 offset、unknownDependences 静默）以 [PTOAS #1679](https://github.com/hw-native-sys/PTOAS/issues/1679) 跟踪（最小复现 A/A′/B bar 计数 1/3/0 + 源码定位 + 修复诉求），修复落地前三类形态无 IR 层保序契约 | ✅ 责任移交定案（G4 按 m2 §9.5 的原始划界落地）；#1679 待 PTOAS 答复；mem-to-value 动态 offset 转发为另一 PTOAS 侧请求 |
 | P-声明盲区 | Vectorize | 只出现在 store predicate 里的 fragment 读不会被声明收集 | ✅ 已关闭（声明收集与残留检查显式遍历 store predicate） |
 | 报文误导 | Verify | 跨 SIMD_VF 共享 fragment 时的报文把用户错误说成 pass 顺序问题 | ✅ 已关闭（前扫描以 ownership 报文拒绝 + Verify 报文如实化） |
 | A3 | 偏差 + 缺口 | G2 前置展开在 ReducerPlanAndMaterialize 之前，materializer 的 fill/finalize/copy 不会被展开（口径：Storage/Reduce 直接消费，见 §2.1）；[1] 形状的逻辑 fill 只写 lane0（当前准入面内无害，PR-6 广播初始化需另行处理） | ✅ ascend_copy 补门已关闭；📌 materializer 偏差与 [1] fill 归 PR-6 |
 | A5 | 偏差 + 缺口 | ~~G3 谓词恢复作用于所有 store~~ **已随 base 谓词化消解**：base Legalize 自身对 UB 做谓词化 masked store（不再有“恢复 vsel”的对象），嵌套 And/Or 由 base 降为 mask 合取——本文的 fragment 分支消费同一机制，无独立范围可言 | ✅ 已关闭（base bc715beb + 本文 fragment 接入） |
-| B2 | 崩溃 | [VL] fragment 串行累加器：`TryRegionCarry` 不查 scope + store/load 分派顺序相反 → 写 vreg 读 backing，终至 ICHECK | ⚠ carry 分派统一 scope 检查；支持面如实为"2D fragment 累加器"；修复时可评估 fragment 串行 RMW 改走 vecscope 分裂（base 分配提升后不再多地址，vecscope 切换是完整同步点） |
-| B3 | 偏差 | base 的 roundtrip 消除对 VF 内 1D fragment 同样消除 store→load（偏离 m2 §5.5.4/§10.2 访存消除归 PTOAS），被消除 fragment 的 backing 仍被预留且不再声明 | ⚠ **决策已定待实施**：对 local.fragment 关闭该消除（关闭后保留 UB 往返 + mem_bar，语义正确） |
-| C5 | 提交结构 | 已重构：builtin 前置、Verify 放开与转换同提交、FFI 注册与调用同提交、逐提交可编译（三个点名中间提交的运行验证待跑） | ✅（运行级验证待跑） |
+| B2 | 崩溃 | [VL] fragment 串行累加器：`TryRegionCarry` 不查 scope + store/load 分派顺序相反 → 写 vreg 读 backing，终至 ICHECK | ✅ 已关闭（三级防护在树：split 侧、region carry 侧（`TryRegionCarry` scope 检查）、单元 shell 侧（`AnalyzeLoopShell` 排除 fragment + `EmitCarryWriteback` 防御断言 `vectorize_parallel_to_pto.cc:1757`））。📌 登记残项：carry 分派统一 scope 检查的重构、1D [VL] 串行累加器支持面（如实为不支持，走 2D fragment 累加器）、fragment 串行 RMW 改走 vecscope 分裂的评估 |
+| B3 | 偏差 | base 的 roundtrip 消除对 VF 内 1D fragment 同样消除 store→load（偏离 m2 §5.5.4/§10.2 访存消除归 PTOAS），被消除 fragment 的 backing 仍被预留且不再声明 | ✅ 已实施关闭（`b6fcb599`：按 buffer 门控——`eliminate_simdvf_roundtrip.cc` 以 `is_fragment`（load 侧也置位）把 fragment 缓冲排除在两条规则外，同区域普通 UB 往返照常消除） |
+| C5 | 提交结构 | 已重构：builtin 前置、Verify 放开与转换同提交、FFI 注册与调用同提交、逐提交可编译 | ✅ 三个点名中间提交（`4e649c5b`/`aeb9a140`/`bdb70e3c`）逐提交编译 + 结构套件均通过 |
 | Q4 | 调度交互 | SubcoreProjector 不认识 slot plan（投影 kernel 复制 fragment 后 plan 仍指向原 buffer） | ✅ 已关闭（分类拒绝；投影改写 plan 等真实需求出现再做）；带 `get_subblock_idx` 的构造用例未写（API 复杂度中等，登记） |
 
 ### 8.2 测试与验收缺口
@@ -451,7 +451,7 @@ M4 新解锁家族为 6 个（sv2、sv3、cf1、cf3、cf4、cf6；sv1 属 M1、c
 
 ## 9. 实施计划与当前状态
 
-**提交序列（2026-10-23，HEAD `21a4d976`，18 提交，base `bc715beb`；每个提交独立可编译，Verify 放开与转换实现同提交，pipeline 注册与 FFI/C++ 实现同提交，路由断言随注册同提交翻转）**：
+**提交序列（2026-10-23；代码 18 提交至 `21a4d976`，base `bc715beb`；docs 两提交：`da92eea3` 汇编、本提交状态同步；每个代码提交独立可编译，Verify 放开与转换实现同提交，pipeline 注册与 FFI/C++ 实现同提交，路由断言随注册同提交翻转）**：
 
 | # | 提交 | 内容 |
 |---|---|---|
@@ -465,7 +465,7 @@ M4 新解锁家族为 6 个（sv2、sv3、cf1、cf3、cf4、cf6；sv1 属 M1、c
 | 8 | `b6fcb599` | per-buffer 往返门控 + ascend_copy 补门 + A6 规范断言 |
 | 9 | `539ff03d` | 评审回归用例 |
 | 10 | `bdb70e3c` | 联合布局求解器（R4 重写） |
-| 11 | `b685a8ca` | kernel 级 entry 范围 + 跨单元 WAR（后被 `fb42b4b0` 随 bar 移除一并删除——历史保留 add+delete，P1-1 决策可能再引入） |
+| 11 | `b685a8ca` | kernel 级 entry 范围 + 跨单元 WAR（后被 `fb42b4b0` 随 bar 移除一并删除——历史保留 add+delete；P1-1 已定案维持移除，不再引入） |
 | 12 | `4e649c5b` | 组合 dist_mode 发射 + 分类诊断 + 后置检查加固（提交说明已按实际 diff 校正） |
 | 13 | `aeb9a140` | 未对齐展开（fragment 侧门控）+ 投影门 |
 | 14 | `9eba46e7` | 求解器/容量/新形态用例 |
@@ -474,11 +474,11 @@ M4 新解锁家族为 6 个（sv2、sv3、cf1、cf3、cf4、cf6；sv1 属 M1、c
 | 17 | `fa146932`→`3b6f4a9e` | 注解 pinned 参与 + 退化维用例 |
 | 18 | `21a4d976` | 十五轮评审修复（DSU 确定性、group 组合、G2 fragment 侧门控 + Cast、unroll 绑定、死缓冲容忍、显式字段比较、no-contract 终检、死代码清理、7 个新结构用例 + 设备用例） |
 
-**验证记录（2026-10-23，238，PTOAS master `d302630695` + MR274，干净构建）**：
-- 结构 + 容量：**48/48**（含本轮新增：确定性合并触发、unroll 包裹、死 rank-3 容忍、UB 多下标正例、U3 双 kernel 负例、G2 UB 侧放行、注解 pinned 翻转）；
-- 全 pto 目录（设备含）：上一轮 628/628；本轮修复后的全量复验在跑（结果落地后更新此行）；
-- 三个点名中间提交（`4e649c5b`/`aeb9a140`/`bdb70e3c`）的编译 + 结构套件验证待跑。
+**验证记录（2026-10-23，238，PTOAS master `d30269595` + MR274，干净构建）**：
+- 结构 + 容量：**81/81**（干净重建后；含十五轮新增：确定性合并触发、unroll 包裹、死 rank-3 容忍、UB 多下标正例、U3 双 kernel 负例、G2 UB 侧放行、注解 pinned 翻转等 7 项）；
+- 全 pto 目录（设备含）：**636/636**（推送前树相同代码状态取得；其后仅 docs 提交，不影响结果。推送当日 238 设备被他人占用（Alarm/外部 HBM），最终树复跑属环境项、非代码项）；
+- 三个点名中间提交（`4e649c5b`/`aeb9a140`/`bdb70e3c`）逐提交编译 + 结构套件**均通过**。
 
 **需要撤回的历史声明**（原文已随本轮重写删除，此处留痕）："保序整体移交 PR307"（P1-1 风险待决策）、"SimdVF 级注解已测 fail-closed"（实为冲突路径，专属拒绝不可达）、"功能缺口已清零"（本轮又修了 DSU 确定性等）、"U5 已分类化"（slot 报文是、Z3 已还原）、"容量四用例已补齐"（ping/pong 已按真多轮语义修正）。
 
-**合入前待办**：①P1-1 保序决策（区域门控 / 全量恢复 / 拒绝）+ 对应设备用例；②跨 vecscope 保序的设备 A/B + PTOAS 答复；③中间提交验证；④全量复验数字回填。
+**合入前待办（2026-10-23 更新）**：①~~P1-1 保序决策~~**已定案**（维持全部移除，不门控/不恢复/不拒绝；覆盖缺口以 [PTOAS #1679](https://github.com/hw-native-sys/PTOAS/issues/1679) 跟踪——多 chunk sv3 设备用例已在套件中且数值正确）；②PTOAS 答复 pending（#1679 已提，含 IR 层 A/B：A/A′/B bar 计数 1/3/0）；③~~中间提交验证~~已通过；④~~全量复验数字回填~~已完成（81/81、636/636）。**剩余开放**：#1679 答复后按其修复结论复验三类形态设备面；J4 的 TileLang 负例断言更新待 ptoas 报错面稳定；238 设备空闲时补最终树复跑（环境项）。

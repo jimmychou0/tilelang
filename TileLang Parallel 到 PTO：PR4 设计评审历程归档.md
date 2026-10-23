@@ -19,6 +19,7 @@
 | 十三轮 | 设计对照终审 | 17 提交（`fa146932`） | PTOAS rebase master+274、J4/J2 master 复测、注解/退化维补测、形态差异登记 |
 | 十四轮 | J4 定案 | wrapper 修复 | J4/J2/退出码定案为环境侧 bug；全量 628/628 |
 | 十五轮 | 全量评审修复 | 18 提交（`21a4d976`） | P1-2/P1-3 + G2/J3/口径/死代码批修；P1-1 待决策 |
+| 十六轮 | P1-1 定案 + 文档状态同步 | 18 代码提交 + docs（`da92eea3` + 同步提交） | 决策：维持 bar 全部移除，不门控/不恢复/不拒绝；覆盖缺口提 PTOAS [#1679](https://github.com/hw-native-sys/PTOAS/issues/1679)；B2/B3/U1/C5 行与 §9 验证数字回填 |
 
 ## 一轮（R1–R8）采纳结论
 
@@ -88,6 +89,10 @@ PTOAS rebase 至 master `d30269595`（PR307 已上游）+ MR274，全量 624/625
 ## 十五轮（全量代码评审修复，2026-10-23）
 
 Claude 全量只读评审（17 提交 + PTOAS PR307 源码）确认 3 个 P1：P1-1 bar 移除后三类形态（>2 层嵌套、vecscope 外变量 offset——恰为本 PR 新增的 k×multi-chunk 2D / kernel 级 f[b,j] / split f[t,i]）在 PR307 只记 Unknown 不插 bar，现有设备全绿是幸存者偏差（修复方案待用户决策：区域门控/全量恢复/拒绝）；P1-2 求解器 DSU 重挂根丢约束 → 构建不可复现（已修：值迁移 + 冲突来源）；P1-3 组合发射丢 group → 静默算错（已修：stride-group 加载 + vbrc(group=)）。同轮修复：G2 未对齐门控收窄到 fragment 侧、J3 三处、T.unroll 绑定口径、死缓冲容忍、显式字段比较、no-contract 终检、死代码清理。另定案 J4=环境侧 wrapper bug、J2=CANN 版本要求。提交信息错位已改写。
+
+## 十六轮（P1-1 定案 + 文档状态同步，2026-10-23）
+
+PR owner 决策关闭十五轮遗留的 P1-1：**维持 TileLang 侧 mem_bar 全部移除**（区域门控/全量恢复/形态拒绝三个候选方案均不采用）——vecscope 内保序不归前端，覆盖缺口作为 PTOAS 缺陷跟踪。实证材料：三个前端无关最小复现（PTODSL，纯 `castptr` + `vmi.vload/vstore`，master 可复现）在同一编译命令下 bar 计数 A(3-IV)=1、A′(2-IV 对照)=3、B(vecscope 外变量 offset)=0；源码定位 `VecScopeMemBarAnalysis.cpp:546`（IV 链 >2 放弃）、`VecScopeMemoryFootprint.cpp:259`（外值 offset 置 inexact）、`:334`（unknownDependences 只写不读、无诊断输出）；gym sv2/sv3 未覆盖的根因 = 标准形态每行单 chunk（Q=1）恰在 2-IV 包线内，多 chunk（N>VL/尾块）才引入第 3 个 IV。已提 [hw-native-sys/PTOAS#1679](https://github.com/hw-native-sys/PTOAS/issues/1679)（复现 + IR 证据 + 按优先级的修复诉求：忽略纯包裹 IV 层 / region 级保守 footprint / 保守模式开关 / 暴露诊断）。文档同步：§8.1 B2（三级防护在树，残项转登记）/B3（`b6fcb599` 已实施）/U1（no-contract 终检已落地，删待办）/C5（中间提交验证通过）改 ✅，§9 验证记录回填（结构 81/81 干净重建、全 pto 目录 636/636 树相同状态、`4e649c5b`/`aeb9a140`/`bdb70e3c` 逐提交通过），合入前待办按定案改写（剩余开放：#1679 答复后复验、J4 负例断言待 ptoas 报错面、238 设备空闲补最终复跑）。另修正 §9 工具链哈希笔误（`d302630695` → `d30269595`）。
 
 ## 附：ST 套件 annotate_layout 排查（R4 §3.0③ 的执行记录）
 
