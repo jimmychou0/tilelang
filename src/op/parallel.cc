@@ -4,6 +4,7 @@
  */
 
 #include "parallel.h"
+#include "pto_index_analysis.h"
 #include "support/check.h"
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ir/cast.h>
@@ -20,6 +21,7 @@
 
 #include "../layout/layout.h"
 #include "../layout/utils.h"
+#include "../ascend/transform/pto_fragment_layout_solver.h"
 #include "../transform/loop_partition.h"
 #include "../transform/loop_vectorize.h"
 #include "arith/int_operator.h"
@@ -171,7 +173,8 @@ void ParallelLoopNestVisitor::VisitExpr_(const CallNode *op) {
   StmtExprVisitor::VisitExpr_(op);
 }
 
-ParallelOpNode::ParallelOpNode(For root) : root_(root), V(this) {
+ParallelOpNode::ParallelOpNode(For root, bool pto_multi_subscript)
+    : root_(root), V(this), pto_multi_subscript_(pto_multi_subscript) {
   V.VisitStmt(root);
   // Cache any annotated layout/predicate on the outermost loop.
   using namespace attr;
@@ -261,11 +264,47 @@ void ParallelOpNode::ExpandBindValues(
 void ParallelOpNode::RecordBufferAccess(const Buffer &buffer,
                                         const Array<PrimExpr> &indices,
                                         bool is_write) {
+  // Multi-subscript collection is scoped to local.fragment buffers: only
+  // fragment accesses come in whole-entry-shifted groups (f[i] with
+  // f[i+VL], the expanded G2 self-copy f[i+128] = f[i]), and only they
+  // have downstream per-access proofs (lane equality, entry interval)
+  // that make each group independently safe. A non-fragment buffer with
+  // differing subscripts keeps the strict structural-equality ICHECK —
+  // the layout engine still consumes the single first group only.
+  if (pto_multi_subscript_ && buffer.scope() == "local.fragment") {
+    // Record every distinct subscript group. The first group also
+    // populates indice_map_ so SIMT consumers (cost model, fragment
+    // validation, LowerTileOp remapping) see unchanged values.
+    auto &groups = multi_subscripts_[buffer];
+    bool found = false;
+    for (auto &g : groups) {
+      if (StructuralEqual()(g.indices, indices)) {
+        if (is_write) {
+          g.is_write = true;
+        } else {
+          g.is_read = true;
+        }
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      BufferAccessInfo info;
+      info.indices = indices;
+      info.is_write = is_write;
+      info.is_read = !is_write;
+      groups.push_back(std::move(info));
+    }
+  }
   auto it = indice_map_.find(buffer);
   if (it != indice_map_.end()) {
-    ICHECK(StructuralEqual()(it->second.indices, indices))
-        << buffer << ": " << indices << " and " << it->second.indices
-        << SpanHintSuffix(buffer->span);
+    if (pto_multi_subscript_ && buffer.scope() == "local.fragment") {
+      // First group wins (recorded above); only the access kind widens.
+    } else {
+      ICHECK(StructuralEqual()(it->second.indices, indices))
+          << buffer << ": " << indices << " and " << it->second.indices
+          << SpanHintSuffix(buffer->span);
+    }
   } else {
     BufferAccessInfo info;
     info.indices = indices;
@@ -344,7 +383,14 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &layout_args,
     // solved loop with fragments it cannot address, and the thrown
     // LayoutConflictException lets free mode discard the attempt. Strict and
     // common levels have no discard channel, so they keep the early-out.
-    if (level == InferLevel::kFree && loop_layout_.defined()) {
+    //
+    // PTO SIMD regions skip this SIMT containment check on purpose: the
+    // lane layout covers the padded execution space while PTO fragment
+    // (slot) layouts keep the buffer's unpadded logical shape — the two
+    // ranges differ by design, and per-access fit is proven separately by
+    // the shared fragment-access analysis in Verify/Vectorize.
+    if (level == InferLevel::kFree && loop_layout_.defined() &&
+        !layout_args.in_pto_simd_vf) {
       ValidateCandidateAgainstFragments(loop_layout_, layout_args,
                                         /*throw_on_error=*/true,
                                         /*check_forward_index=*/false);
@@ -1092,7 +1138,7 @@ std::pair<int64_t, int64_t> CheckedPaddingForInference(int64_t extent,
 
 int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
                          int64_t M, int64_t N, int64_t lanes,
-                         std::string *why) {
+                         const LayoutMap &solved_layouts, std::string *why) {
   PtoAccessCollector collector;
   collector(root->body);
 
@@ -1122,6 +1168,44 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
       // Per-lane register (T.alloc_var): no lane-address classification; the
       // whole-buffer form is promoted to a vreg by VectorizeParallelToPTO.
       if (pto::IsLaneScalarBuffer(access.buffer)) {
+        continue;
+      }
+      // Fragment buffers exit the continuity proof: their logical
+      // row-major strides say nothing about the slot backing's layout.
+      // The jointly solved layout (injected ahead of inference, R4 §3.7)
+      // instead constrains the direction: exactly the layout's lane dim
+      // may depend on the candidate's vectorized coordinate. A fragment
+      // without a solved layout falls back to the legacy continuity
+      // proof below (it keeps pre-solver inputs buildable).
+      const bool is_fragment = access.buffer.scope() == "local.fragment";
+      if (is_fragment && solved_layouts.count(access.buffer) != 0) {
+        const Fragment solved = solved_layouts[access.buffer].as<Fragment>().value();
+        const int lane_dim = pto::PtoFragmentLaneDim(solved);
+        ICHECK_GE(lane_dim, 0)
+            << "[PTO layout inference] the solved layout for fragment `"
+            << access.buffer->name
+            << "` lost its canonical single-dim lane form";
+        int deps = 0;
+        int dep_dim = -1;
+        for (size_t d = 0; d < access.indices.size(); ++d) {
+          if (tirx::UsesVar(access.indices[d], [&](const VarNode *var_node) {
+                return var_node == sel_var.get();
+              })) {
+            ++deps;
+            dep_dim = static_cast<int>(d);
+          }
+        }
+        if (deps != 1 || dep_dim != lane_dim) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << access.buffer->name
+              << "` is accessed with indices " << access.indices
+              << ", which do not address the solved layout's lane "
+                 "dimension "
+              << lane_dim << " under the "
+              << (select_inner ? "inner (j)" : "outer (i)") << " mapping";
+          *why = oss.str();
+          return false;
+        }
         continue;
       }
       // Resolve Bind aliases per index with the shared resolver (cycle /
@@ -1301,6 +1385,10 @@ ParallelOpNode::InferPtoSimdLayout(const LayoutInferArgs &layout_args) const {
   // extents/strides (the tail's readable range is a caller precondition).
   DataType idx_dtype = loop_vars_[0]->var.dtype();
   PrimExpr flattened;
+  // The loop variable distributed over lanes (1D: the only var; 2D: the
+  // selected dimension's var). Fragment buffer layouts below key their
+  // entry/lane split off this variable.
+  Var pto_vectorized_var;
   // The forward vars handed to the Fragment constructor: the selected
   // dimension's IterVar is padded up to P so the thread extent L times the
   // chunk extent P/L covers the padded input space bijectively; the kept
@@ -1317,6 +1405,7 @@ ParallelOpNode::InferPtoSimdLayout(const LayoutInferArgs &layout_args) const {
                                loop_vars_[0]->var, IterVarType::kDataPar));
     }
     flattened = InputPlaceholder(0);
+    pto_vectorized_var = loop_vars_[0]->var;
   } else {
     // 2D mapping: the vectorized dimension is
     // chosen from the buffer accesses (indices + strides), then the
@@ -1329,8 +1418,9 @@ ParallelOpNode::InferPtoSimdLayout(const LayoutInferArgs &layout_args) const {
     const Var &i_var = loop_vars_[0]->var;
     const Var &j_var = loop_vars_[1]->var;
     std::string candidate_why;
-    int required =
-        PtoRequiredVectorDim(root_, i_var, j_var, M, N, lanes, &candidate_why);
+    int required = PtoRequiredVectorDim(root_, i_var, j_var, M, N,
+                                         lanes, layout_args.layout_map,
+                                         &candidate_why);
     if (required < 0) {
       // Both candidates failed (an access that is neither continuous nor a
       // lane-uniform load under the padded domain). Report the concrete
@@ -1343,6 +1433,7 @@ ParallelOpNode::InferPtoSimdLayout(const LayoutInferArgs &layout_args) const {
       throw LoopLayoutInjectiveException(oss.str());
     }
     const bool select_inner = required == 1;
+    pto_vectorized_var = select_inner ? j_var : i_var;
     const int64_t sel_extent = select_inner ? N : M;
     const int64_t kept_extent = select_inner ? M : N;
     // Shared checked padding for the selected dimension.
@@ -1405,9 +1496,118 @@ ParallelOpNode::InferPtoSimdLayout(const LayoutInferArgs &layout_args) const {
 
   loop_layout_ = fragment;
   loop_layout_inferred_ = true;
-  // No buffer layout updates: PTO SIMD loops access
-  // shared/global buffers only, which have no per-lane fragment layouts.
-  return {};
+
+  // Fragment buffer (local.fragment) layouts for the PTO slot path: the
+  // buffer's element (.., c_sel, ..) maps to storage lane c_sel % L and slot
+  // entry per-lane-block along the vectorized buffer dim. The layout is
+  // canonical for the buffer's *logical* shape (unpadded — buffer mapping
+  // only needs to be conflict-free on logical elements, unlike the loop
+  // layout's padded execution space). Whether a concrete access fits this
+  // layout (storage lane == execution lane, entry free of the lane
+  // coordinate) is proven per access by the shared fragment-access analysis
+  // used by VerifyParallelToPTO and VectorizeParallelToPTO.
+  //
+  // The vectorized buffer dim is the one whose access index depends on the
+  // vectorized loop var. An access where no dim depends on it imposes no
+  // lane distribution from this unit (the buffer may still get a layout
+  // from another unit); more than one dependent dim has no supported slot
+  // lowering and is rejected here, closest to the access.
+  LayoutMap buffer_layouts;
+  for (const Buffer &buffer : access_order_) {
+    if (!IsFragmentBuffer(buffer)) {
+      continue;
+    }
+    // The joint solver already fixed this buffer's layout and injected
+    // it ahead of inference (R4 §3.5): the injected entry is the fact
+    // the dimension selection consumed, so re-proposing here could only
+    // disagree with it at the merge point. Skip; the access proofs in
+    // Verify/Vectorize check every concrete access against it.
+    if (layout_args.layout_map.count(buffer) != 0) {
+      continue;
+    }
+    const auto &access = GetAccessInfo(buffer);
+    ICHECK_EQ(access.indices.size(), buffer->shape.size())
+        << "[PTO layout inference] fragment buffer " << buffer
+        << " access arity does not match its shape rank";
+    std::vector<int64_t> dims;
+    dims.reserve(buffer->shape.size());
+    for (const auto &s : buffer->shape) {
+      const int64_t *v = as_const_int(s);
+      if (v == nullptr || *v <= 0) {
+        std::ostringstream oss;
+        oss << "[PTO layout inference] fragment buffer `" << buffer->name
+            << "` accessed inside a PTO SIMD_VF unit must have a "
+               "compile-time constant positive shape, got "
+            << buffer->shape;
+        throw pto::PtoAnalysisError(oss.str());
+      }
+      dims.push_back(*v);
+    }
+    if (dims.size() > 2u) {
+      std::ostringstream oss;
+      oss << "[PTO layout inference] fragment buffer `" << buffer->name
+          << "` of rank " << dims.size()
+          << " is not supported yet; PTO slot storage covers 1D/2D "
+             "fragments only";
+      throw pto::PtoAnalysisError(oss.str());
+    }
+    int vectorized_dim = -1;
+    int dependent_dims = 0;
+    for (size_t d = 0; d < access.indices.size(); ++d) {
+      if (tirx::UsesVar(access.indices[d], [&](const VarNode *var_node) {
+            return var_node == pto_vectorized_var.get();
+          })) {
+        ++dependent_dims;
+        vectorized_dim = static_cast<int>(d);
+      }
+    }
+    if (dependent_dims == 0) {
+      continue;
+    }
+    if (dependent_dims > 1) {
+      std::ostringstream oss;
+      oss << "[PTO layout inference] fragment buffer `" << buffer->name
+          << "` is accessed with indices " << access.indices
+          << " where more than one dimension depends on the vectorized "
+             "coordinate `"
+          << pto_vectorized_var->name_hint
+          << "`; cross-dimension lane addressing has no slot lowering";
+      throw pto::PtoAnalysisError(oss.str());
+    }
+    const int64_t sel = dims[vectorized_dim];
+    const auto [pad_sel, P_sel] = CheckedPaddingForInference(sel, lanes);
+    (void)pad_sel;
+    const int64_t per_dim_entries = P_sel / lanes;
+    int64_t entry_count = per_dim_entries;
+    for (size_t d = 0; d < dims.size(); ++d) {
+      if (static_cast<int>(d) != vectorized_dim) {
+        entry_count *= dims[d];
+      }
+    }
+    if (entry_count > std::numeric_limits<int32_t>::max()) {
+      std::ostringstream oss;
+      oss << "[PTO layout inference] fragment buffer `" << buffer->name
+          << "` needs " << entry_count
+          << " slot entries, overflowing the int32 index space";
+      throw pto::PtoAnalysisError(oss.str());
+    }
+    const DataType ity = DataType::Int(32);
+    PrimExpr lane_e = FloorMod(InputPlaceholder(vectorized_dim),
+                               IntImm(ity, static_cast<int>(lanes)));
+    PrimExpr entry_e = FloorDiv(InputPlaceholder(vectorized_dim),
+                                IntImm(ity, static_cast<int>(lanes)));
+    if (dims.size() == 2u) {
+      const int other_dim = vectorized_dim == 0 ? 1 : 0;
+      entry_e = InputPlaceholder(other_dim) *
+                    IntImm(ity, static_cast<int>(per_dim_entries)) +
+                entry_e;
+    }
+    auto buf_frag =
+        Fragment(buffer->shape, {entry_e}, lane_e, Integer(1), std::nullopt)
+            ->BindThreadRange(layout_args.thread_bounds);
+    buffer_layouts.Set(buffer, buf_frag);
+  }
+  return buffer_layouts;
 }
 
 Fragment

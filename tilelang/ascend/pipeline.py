@@ -85,6 +85,13 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = ascend_transform.UnrollLoopSkipVF()(mod)
     mod = tilelang.transform.Simplify()(mod)
 
+    if target_is_pto(target):
+        # Rewrite fragment-touching T.fill/T.copy inside converting SIMD_VF
+        # regions into T.Parallel loops before inference, so their accesses
+        # join the ordinary PTO unit conversion (entry/lane layout, chunk
+        # masks, slot emission) instead of the tileop fill/copy lowering.
+        mod = ascend_transform.ExpandPtoFragmentFillCopy()(mod)
+
     mod = ascend_transform.AscendLayoutInference()(mod)
     mod = tilelang.transform.ReducerPlanAndMaterialize()(mod)
     LayoutVisual(mod)
@@ -104,6 +111,13 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # them to ascend_fill_l1 after scheduling, which codegen emits as
     # asc_fill_l1. Must run before AutoSchedule.
     mod = ascend_transform.AscendInsertOOBPadding()(mod)
+
+    # Declare the UB backing of every PTO slot (local.fragment buffer used by
+    # a converting SimdVF region) before scheduling, so AutoSchedule budgets
+    # the reservation and the address pass chain can rewrite it. The pass is
+    # bookkeeping-only; the backing gains accesses only at Vectorize time.
+    # It runs on both the auto-scheduled and manual scheduling paths.
+    mod = ascend_transform.PlanPtoSlotStorage()(mod)
 
     if auto_schedule_enabled:
         mod = ascend_transform.NormalizeControlFlowForSchedule()(mod)

@@ -5385,6 +5385,11 @@ CodeGenTileLangPTO::PtoValueKind CodeGenTileLangPTO::ClassifyVmiCallResult_(
   if (name == "tl.vmi.vstore" || name == "tl.vmi.vscatter") {
     return PtoValueKind::kVoid;
   }
+  if (name == "tl.vmi.declare_fragment_buffer") {
+    // The declaration names a memory object; its handle only ever appears
+    // as a vload/vstore base, never as scalar/vector data.
+    return PtoValueKind::kHandle;
+  }
   static const std::unordered_set<std::string> kDataOps = {
       "tl.vmi.vci",      "tl.vmi.vbrc",
       "tl.vmi.vzip",     "tl.vmi.vadd",
@@ -5498,6 +5503,86 @@ void CodeGenTileLangPTO::CheckPtoVmiBridgeOperand_(
   }
 }
 
+void CodeGenTileLangPTO::PrintPtoMemrefDeclare_(const CallNode *op,
+                                                std::ostream &os) {
+  ICHECK_EQ(op->args.size(), 3U)
+      << "tl.vmi.declare_fragment_buffer expects "
+         "(backing_ptr, count, lanes), got "
+      << op->args.size() << " arguments";
+  // Element dtype comes from the typed backing address, never from the
+  // Handle. The operand is the standard address form the address passes
+  // rewrote (tl.access_ptr pre-lowering, tvm_access_ptr afterwards), so
+  // both the dtype and the element offset survive MergeUBAllocations —
+  // the merged arena must not silently retype the declaration.
+  const DataType elem_dtype =
+      GetAnnotatedPointerDtype(op->args[0], DataType());
+  // An unresolved operand keeps the invalid fallback (bits == 0).
+  ICHECK(elem_dtype.bits() > 0 && elem_dtype.is_scalar())
+      << "tl.vmi.declare_fragment_buffer requires a typed scalar backing "
+         "address, got "
+      << op->args[0];
+  const auto *count = op->args[1].as<IntImmNode>();
+  const auto *lanes = op->args[2].as<IntImmNode>();
+  ICHECK(count != nullptr && lanes != nullptr && count->value > 0 &&
+         lanes->value > 0)
+      << "tl.vmi.declare_fragment_buffer count/lanes must be positive "
+         "compile-time integers";
+  PrimExpr elem_index;
+  const VarNode *buffer_var = nullptr;
+  ICHECK(GetAddressOfIndex(op->args[0], &elem_index, &buffer_var))
+      << "tl.vmi.declare_fragment_buffer requires a standard address "
+         "operand the address passes can rewrite (tl.access_ptr / "
+         "tvm_access_ptr), got "
+      << op->args[0];
+  // The merged UB arena is emitted as castptr(const(0)), so the backing's
+  // element offset scaled to bytes is the final UB byte address. The
+  // declaration carries the backing offset; the accesses' element offsets
+  // (entry * lanes) must not add it again.
+  const int64_t elem_bytes =
+      (PhysicalElementBits(elem_dtype) + 7) / 8 * elem_dtype.lanes();
+  std::string address;
+  int64_t constant_index = 0;
+  if (TryGetConstInt(elem_index, &constant_index)) {
+    ICHECK_GE(constant_index, 0)
+        << "tl.vmi.declare_fragment_buffer backing offset must be "
+           "non-negative, got "
+        << constant_index;
+    address = std::to_string(constant_index * elem_bytes);
+  } else {
+    // Dynamic backing offset: print the element index and scale in one
+    // expression. int() keeps the printed Python arithmetic exact (the
+    // TIR index may be int32; Python integers are unbounded), matching
+    // the byte-wide multiply the constant path performs.
+    address = "int(" + RemoveOutermostParentheses(PrintExpr_(elem_index)) +
+              ") * " + std::to_string(elem_bytes);
+  }
+  os << "pto.memref_declare(" << address << ", (" << count->value *
+                                                     lanes->value
+     << ",), " << ScalarType(elem_dtype) << ")";
+}
+
+namespace {
+// The dist_mode annotation of a tl.vmi call, "" when absent.
+std::string VmiDistModeOf_(const CallNode *op) {
+  auto it = op->annotations.find("dist_mode");
+  if (it == op->annotations.end()) {
+    return "";
+  }
+  const auto *mode = (*it).second.as<StringImmNode>();
+  ICHECK(mode != nullptr) << "dist_mode annotation must be a string";
+  return mode->value;
+}
+
+// The size annotation of a tl.vmi call (the vector lane count).
+int64_t VmiSizeOf_(const CallNode *op) {
+  auto it = op->annotations.find("size");
+  ICHECK(it != op->annotations.end()) << "tl.vmi call requires a size";
+  const auto *size = (*it).second.as<IntImmNode>();
+  ICHECK(size != nullptr) << "tl.vmi size annotation must be an integer";
+  return size->value;
+}
+}  // namespace
+
 void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
                                           std::ostream &os) {
   auto opt_call_op = op->op.as<Op>();
@@ -5511,6 +5596,12 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
   for (const auto &[key, value] : op->annotations) {
     std::string key_str = key;
     if (key_str == "loc" || key_str == "ip") {
+      continue;
+    }
+    // dist_mode no longer exists in PTODSL (removed by PTOAS!293); every
+    // form is composed at emission (see the vload/vstore branches below),
+    // and "continuous" is the default load behavior.
+    if (key_str == "dist_mode" && op_name == "tl.vmi.vload") {
       continue;
     }
     kwargs.emplace_back(std::move(key_str), value);
@@ -5588,6 +5679,64 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
        (op_name == "tl.vmi.vbrc" && !integer_source_literal)) &&
       scalar_integer_input && integer_data_result;
 
+  // Composed dist_mode forms (PTODSL removed the dist_mode kwarg,
+  // PTOAS!293): emit before the generic call prefix opens, each branch
+  // prints its own complete expression and returns.
+  // The PTODSL memory ABI is (source, offset, ...): keep TileLang's
+  // (ptr, elem_offset) pair split instead of folding to addptr.
+  auto pto_source = [&](const PrimExpr &ptr) -> std::string {
+    return PrintExpr_(ptr);
+  };
+  auto pto_offset = [&](const PrimExpr &offset) -> std::string {
+    if (is_zero(offset)) {
+      return "0";
+    }
+    return RemoveOutermostParentheses(PrintExpr_(offset));
+  };
+  if (op_name == "tl.vmi.vload" || op_name == "tl.vmi.vstore") {
+    const std::string dist_mode = VmiDistModeOf_(op);
+    if (op_name == "tl.vmi.vload" && dist_mode == "brc") {
+      // A broadcast load is a one-element load followed by vbrc.
+      ICHECK_EQ(op->args.size(), 2U) << "tl.vmi.vload expects (ptr, offset)";
+      os << "pto.vmi.vbrc(pto.vmi.vload(" << pto_source(op->args[0]) << ", "
+         << pto_offset(op->args[1]) << ", size=1), size=" << VmiSizeOf_(op)
+         << ")";
+      return;
+    }
+    if (op_name == "tl.vmi.vload" && dist_mode == "dintlv") {
+      // A deinterleaved load is two contiguous loads plus vdintlv with
+      // the full mask (loads stay unmasked in the VMI contract).
+      ICHECK_EQ(op->args.size(), 2U) << "tl.vmi.vload expects (ptr, offset)";
+      const int64_t size = VmiSizeOf_(op);
+      const std::string off = pto_offset(op->args[1]);
+      os << "pto.vmi.vdintlv(";
+      os << "pto.vmi.vload(" << pto_source(op->args[0]) << ", " << off
+         << ", size=" << size << "), ";
+      os << "pto.vmi.vload(" << pto_source(op->args[0]) << ", (" << off
+         << ") + " << size << ", size=" << size << "), ";
+      os << "pto.vmi.create_mask(" << size << ", size=" << size << "))";
+      return;
+    }
+    if (op_name == "tl.vmi.vstore" && dist_mode == "dintlv") {
+      // An interleaved store is vintlv followed by two contiguous
+      // stores, emitted as one statement sequence (vintlv's result is
+      // an indexable pair).
+      ICHECK_GE(op->args.size(), 5U)
+          << "tl.vmi.vstore with dist_mode=dintlv expects (even, odd, ptr, "
+             "offset, mask)";
+      const int64_t size = op->args[0].dtype().lanes();
+      const std::string off = pto_offset(op->args[3]);
+      const std::string mask = PrintExpr_(op->args[4]);
+      os << "_di = pto.vmi.vintlv(" << PrintExpr_(op->args[0]) << ", "
+         << PrintExpr_(op->args[1]) << ", " << mask << "); ";
+      os << "pto.vmi.vstore(_di[0], " << pto_source(op->args[2]) << ", "
+         << off << ", " << mask << "); ";
+      os << "pto.vmi.vstore(_di[1], " << pto_source(op->args[2]) << ", ("
+         << off << ") + " << size << ", " << mask << ")";
+      return;
+    }
+  }
+
   if (bridge_integer_source) {
     os << "pto.vmi.vinterpret_cast(";
   }
@@ -5610,8 +5759,6 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
     PrintExpr_(arg, os);
   };
 
-  // PTODSL vgather/vgatherb/vscatter take a single pointer operand. TileLang
-  // lowers buffer addresses to (ptr, elem_offset); fold them with addptr here.
   auto print_ptr_with_offset = [&](const PrimExpr &ptr,
                                    const PrimExpr &offset) {
     if (is_zero(offset)) {
@@ -7147,6 +7294,10 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
       return;
     }
     if (StartsWith(op_name, "tl.vmi.")) {
+      if (op_name == "tl.vmi.declare_fragment_buffer") {
+        PrintPtoMemrefDeclare_(op, os);
+        return;
+      }
       if (op_name == "tl.vmi.pair_get") {
         ICHECK_EQ(op->args.size(), 2U)
             << "tl.vmi.pair_get expects exactly 2 arguments";

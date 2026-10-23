@@ -63,6 +63,7 @@
 #include <vector>
 
 #include "parallel_to_pto_utils.h"
+#include "pto_slot_plan.h"
 
 namespace tvm {
 namespace tl {
@@ -118,6 +119,16 @@ struct BufferAccessRecord {
   bool predicated = false;
   bool loads_identity = true;
   bool stores_identity = true;
+  /*! True when the buffer is local.fragment, set by any access (loads
+   * included: a fragment that is only read must still disqualify the rules
+   * that would move that read). Round-trip elimination is disabled for
+   * fragment buffers per buffer (B3, design doc §8.1): their store→load
+   * pairs go through the slot backing and the per-unit mem_bar, and
+   * eliminating them at the TileLang level would remove the declared
+   * handle's anchor stores while the backing stays reserved. The guard is
+   * per buffer, not per region — a fragment living next to an ordinary UB
+   * round trip must not switch that round trip off. */
+  bool is_fragment = false;
   /*! Top-level unit ordinal owning each store/load; -1 means "not a
    * top-level parallel unit" (serial wrapper, plain statement, ...). */
   std::vector<int> store_units;
@@ -164,6 +175,8 @@ class StmtAccessCollector final : public StmtExprVisitor {
     BufferAccessRecord &rec = (*out_)[op->buffer->data.get()];
     ++rec.stores;
     rec.store_units.push_back(ordinal_);
+    rec.is_fragment =
+        rec.is_fragment || op->buffer.scope() == "local.fragment";
     if (op->predicate.defined()) {
       rec.predicated = true;
     }
@@ -177,6 +190,8 @@ class StmtAccessCollector final : public StmtExprVisitor {
     BufferAccessRecord &rec = (*out_)[op->buffer->data.get()];
     ++rec.loads;
     rec.load_units.push_back(ordinal_);
+    rec.is_fragment =
+        rec.is_fragment || op->buffer.scope() == "local.fragment";
     if (op->predicate.defined()) {
       rec.predicated = true;
     }
@@ -532,6 +547,12 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
       return nullptr;
     }
     const BufferAccessRecord &t_rec = tit->second;
+    if (t_rec.is_fragment) {
+      // Fragment temp: its store→load pair goes through the slot backing
+      // and the per-unit mem_bar (B3); the rewrite would drop the handle's
+      // anchor accesses while the backing stays reserved.
+      return nullptr;
+    }
     if (t_rec.predicated || t_rec.other != 0 || t_rec.loads < 1 ||
         !t_rec.loads_identity || t_rec.stores != 1 ||
         t_rec.store_units[0] != producer.ordinal ||
@@ -578,6 +599,11 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
         continue;
       }
       const BufferAccessRecord &o_rec = oit->second;
+      if (o_rec.is_fragment) {
+        // Forwarding into a fragment destination would move its anchor
+        // store into the producer unit (B3).
+        continue;
+      }
       if (o_rec.predicated || o_rec.other != 0 || o_rec.loads != 0 ||
           o_rec.stores != 1 || o_rec.store_units[0] != consumer->ordinal) {
         continue;
@@ -619,7 +645,11 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
       // nothing may write `S` anywhere in the region, and adjacency leaves no
       // statement that could.
       auto sit = model.access.find(s);
-      if (sit != model.access.end() && sit->second.stores != 0) {
+      if (sit != model.access.end() &&
+          (sit->second.stores != 0 || sit->second.is_fragment)) {
+        // A fragment source keeps its load inside the copy unit: the load
+        // is the backing-read the slot conversion anchors (B3), and `S`
+        // being single-writer elsewhere is not what makes moving it safe.
         continue;
       }
       std::vector<Stmt> stmts = model.stmts;
@@ -631,8 +661,29 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
     return false;
   }
 
+  /*! The reserved PTO fragment backings must survive this pass: they carry
+   * no accesses until VectorizeParallelToPTO emits them (their whole point
+   * is to be reserved ahead of scheduling), so an access-based pruning
+   * would drop the allocation that those accesses will reference. */
+  std::unordered_set<const VarNode *> PlannedBackingVars(
+      const SBlockNode *block) const {
+    std::unordered_set<const VarNode *> vars;
+    auto value = block->annotations.Get(kPtoSlotPlan);
+    if (!value.has_value()) {
+      return vars;
+    }
+    auto plans = value.value().try_cast<Array<PtoSlotPlan>>();
+    if (!plans.has_value()) {
+      return vars;
+    }
+    for (const PtoSlotPlan &plan : plans.value()) {
+      vars.insert(plan->backing->data.get());
+    }
+    return vars;
+  }
+
   /*! Drop block allocations that no longer take part in any access of the
-   * rewritten region. */
+   * rewritten region, except the planned slot backings above. */
   Array<Buffer> PruneAllocBuffers(const SBlockNode *block,
                                   const Stmt &region) const {
     std::unordered_set<const VarNode *> used;
@@ -645,6 +696,9 @@ class SimdVFRoundTripEliminator final : public StmtExprMutator {
         used.insert(var);
       }
     });
+    for (const VarNode *var : PlannedBackingVars(block)) {
+      used.insert(var);
+    }
     Array<Buffer> kept;
     for (const Buffer &buffer : block->alloc_buffers) {
       if (used.count(buffer->data.get()) != 0) {

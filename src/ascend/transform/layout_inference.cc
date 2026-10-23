@@ -27,6 +27,7 @@
 #include "arith/ir_visitor_with_analyzer.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
+#include "ascend/transform/pto_fragment_layout_solver.h"
 #include "ascend/transform/vf_regions.h"
 #include "backend/common/target_utils.h"
 #include "config.h"
@@ -554,6 +555,16 @@ public:
     }
   };
 
+  /*! Inject the PTO-solved fragment layouts into the initial layout
+   * map so the engine treats them as pre-determined facts (strict
+   * semantics; step 0's floating seed skips buffers that already have a
+   * layout). Called between Collect() and Run(). */
+  void InjectInitialLayouts(const LayoutMap &layouts) {
+    for (const auto &[buffer, layout] : layouts) {
+      annotated_layout_map_.Set(buffer, layout);
+    }
+  }
+
   LayoutInferenceResult Run() {
     // Basic consistency check: infer_list_ and thread_index_vec_ should have
     // the same size
@@ -977,7 +988,7 @@ private:
 
   void VisitStmt_(const ForNode *op) final {
     if (op->kind == ForKind::kParallel) {
-      auto infer = ParallelOp(GetRef<For>(op));
+      auto infer = ParallelOp(GetRef<For>(op), InsidePtoSimdVF());
       for (const auto &buffer : infer->GetAccessOrder()) {
         addToUseList(buffer);
       }
@@ -1493,6 +1504,13 @@ private:
   std::vector<std::unique_ptr<arith::Analyzer>> analyzer_vec_;
   L0SFBindings l0_sf_bindings_;
   Target target_;
+public:
+  const LayoutMap &annotated_layout_map() const {
+    return annotated_layout_map_;
+  }
+  bool target_is_pto() const { return target_is_pto_; }
+
+private:
   LayoutMap annotated_layout_map_;
 
   std::vector<TileOperator> BackupInferList() {
@@ -1802,6 +1820,23 @@ public:
     fptr->body = ParallelLoopFuserSkipSimdVF::Fuse(f->body);
     BufferUseDefCollector collector;
     collector.Collect(f);
+
+    // PTO fragment layout pre-solve (R4 §3.0): after the whole function
+    // is collected (kernel-level annotations loaded) and before the
+    // engine's staged inference, jointly derive every converting region's
+    // fragment layouts — pre-scan rejections (out-of-region access, view
+    // sharing, annotation forms), the parity solve, and the canonical
+    // layouts injected as pre-determined facts. InferPtoSimdLayout skips
+    // re-proposing injected entries and consumes them as direction
+    // constraints in its dimension selection.
+    if (collector.target_is_pto()) {
+      auto pto_layouts =
+          pto::SolvePtoFragmentLayouts(f->body, /*target_is_pto=*/true,
+                                       collector.annotated_layout_map());
+      if (pto_layouts.has_value()) {
+        collector.InjectInitialLayouts(pto_layouts.value());
+      }
+    }
     auto result = collector.Run();
     LayoutInferencer substituter(result, &analyzer);
     fptr->body = substituter.VisitStmt(f->body);
@@ -1836,11 +1871,16 @@ private:
       if (!ContainsPtoSimdRoot(op->body)) {
         return ffi::GetRef<Stmt>(op);
       }
-      // Descend for the lane annotations; only the kLayoutMap writeback is
-      // skipped for the block itself.
+      // Descend for the lane annotations. A converting PTO region with
+      // fragment buffer layouts (the slot storage path) also receives the
+      // block-level kLayoutMap writeback exactly like the generic block
+      // branch below; regions without PTO parallel roots never reach this
+      // point, and a converting region without fragment layouts keeps its
+      // annotation set unchanged (no empty layout_map is written).
       SBlock block = Downcast<SBlock>(IRMutatorWithAnalyzer::VisitStmt_(op));
-      if (block.same_as(GetRef<SBlock>(op))) {
-        return ffi::GetRef<Stmt>(op);
+      if (!result_.layout_map.empty()) {
+        auto block_ptr = block.CopyOnWrite();
+        block_ptr->annotations.Set(attr::kLayoutMap, result_.layout_map);
       }
       return block;
     }

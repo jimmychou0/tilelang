@@ -38,6 +38,8 @@
 #include <utility>
 #include <vector>
 
+#include <set>
+
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/function.h>
@@ -66,6 +68,7 @@
 #include "ascend/transform/buffer_version.h"
 #include "backend/common/target_utils.h"
 #include "op/utils.h"
+#include "pto_slot_plan.h"
 #include "runtime/thread_storage_scope.h"
 #include "support/check.h"
 #include "tir/transforms/ir_utils.h"
@@ -926,8 +929,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
             << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
             << "\" capacity is negative (" << capacity
             << "). Non-eligible and fixed-version buffers already exceed"
-            << " the memory limit. Try using T.annotate_unlimit_memory(\""
-            << group_scopes[g] << "\") or reduce buffer sizes.";
+            << " the memory limit; reduce buffer sizes (raising the "
+               "limit only defers the failure to the final capacity "
+               "check, it does not make the kernel fit the device)";
       }
       int64_t min_usage = 0;
       for (int64_t idx : idxs) {
@@ -937,8 +941,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
         LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
                    << "\" capacity " << capacity
                    << " is insufficient for minimum buffer usage " << min_usage
-                   << ". Try using T.annotate_unlimit_memory(\""
-                   << group_scopes[g] << "\") or reduce buffer sizes.";
+                   << "; reduce buffer sizes (raising the limit only "
+                      "defers the failure to the final capacity check)";
       }
     }
   }
@@ -1393,6 +1397,48 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
       metadata.manual_buffer_versions, groups, "manual version counts");
   unit_builder.SetStorageGroups(groups);
   int64_t shared_mem_limit = GetSharedMemoryLimit(kernel_body);
+  // PTO slot storage: the reserved backings carry no reads or writes at
+  // this point (slot_alloc appears only after Vectorize), so the
+  // access-region buffer enumeration cannot see them. Deduct their full
+  // capacity up front — the scheduler must budget as if every backing were
+  // live and must not assume PTOAS will later promote the slots to
+  // registers. An "unlimited" shared scope skips the
+  // reservation like every other capacity rule.
+  bool shared_unlimited = false;
+  for (const String &scope : metadata.unlimit_memory_scopes) {
+    if (scope == "shared") {
+      shared_unlimited = true;
+      break;
+    }
+  }
+  if (!shared_unlimited) {
+    int64_t slot_bytes = 0;
+    std::set<const VarNode *> seen_backings;
+    // Scan from the kernel root itself, not just its body: a fragment
+    // buffer allocated at kernel scope records its plan on the root block,
+    // and a body-only walk would silently skip that reservation.
+    for (const auto &plan : CollectPtoSlotPlans(metadata.kernel_root)) {
+      if (!seen_backings.insert(plan->backing->data.get()).second) {
+        continue;
+      }
+      slot_bytes += plan->bytes;
+    }
+    if (slot_bytes > 0) {
+      if (shared_mem_limit <= slot_bytes) {
+        std::ostringstream oss;
+        oss << "[AutoSchedule] PTO slot storage reserves " << slot_bytes
+            << " bytes of UB for fragment buffers kept across loops, but "
+               "only "
+            << shared_mem_limit
+            << " bytes are available on this target; reduce the reserved "
+               "fragment sizes or counts (raising the limit only defers "
+               "the failure to the final capacity check — the reservation "
+               "must physically fit)";
+        LOG(FATAL) << oss.str();
+      }
+      shared_mem_limit -= slot_bytes;
+    }
+  }
   unit_builder.SetMemoryLimit("shared", shared_mem_limit);
   if (auto value = metadata.kernel_root->annotations.Get(kAivStorageMap)) {
     unit_builder.SetAivStorages(value.value().cast<AivStorageMap>());
@@ -1442,6 +1488,40 @@ tvm::transform::Pass AutoSchedule() {
     Target target;
     if (target_opt.defined()) {
       target = target_opt.value();
+    }
+    // U3 premise: the slot reservation is budgeted per kernel root
+    // (each root may deduct the full unified buffer), while the final
+    // capacity check in MergeUBAllocations sums the whole function
+    // against one physical cap. With more than one kernel root the two
+    // scopes can silently disagree, so slot kernels require a single
+    // root (full per-root accounting is a registered follow-up).
+    {
+      class RootAndPlanCounter : public tirx::StmtVisitor {
+      public:
+        void VisitStmt_(const tirx::SBlockNode *op) final {
+          if (op->name_hint == "tilelang_root") {
+            ++roots;
+          }
+          if (op->annotations.count(kPtoSlotPlan)) {
+            has_slot_plan = true;
+          }
+          tirx::StmtVisitor::VisitStmt_(op);
+        }
+        int roots = 0;
+        bool has_slot_plan = false;
+      };
+      RootAndPlanCounter counter;
+      counter(func->body);
+      if (counter.roots > 1 && counter.has_slot_plan) {
+        std::ostringstream oss;
+        oss << "[AutoSchedule] PTO slot storage requires a single kernel "
+               "root per function: this function has "
+            << counter.roots
+            << " tilelang_root blocks and reserves fragment backings; the "
+               "per-root budget and the function-wide capacity check "
+               "would cover different scopes";
+        LOG(FATAL) << oss.str();
+      }
     }
     return RewriteTilelangKernels(
         std::move(func), "AutoSchedule",
