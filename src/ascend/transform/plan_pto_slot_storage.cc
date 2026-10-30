@@ -364,10 +364,15 @@ private:
       }
       if (map.value().count(fragment) != 0) {
         auto frag = map.value()[fragment].as<Fragment>();
-        ICHECK(frag.has_value())
-            << "[PlanPtoSlotStorage] layout_map entry for fragment buffer `"
-            << fragment->name << "` must be a tl.Fragment, got "
-            << map.value()[fragment]->GetTypeKey();
+        if (!frag.has_value()) {
+          std::ostringstream oss;
+          oss << "[PlanPtoSlotStorage] layout_map entry for fragment buffer `"
+              << fragment->name << "` must be a tl.Fragment, got "
+              << map.value()[fragment]->GetTypeKey()
+              << "; annotate the canonical PTO fragment form or drop the "
+                 "annotation";
+          LOG(FATAL) << oss.str();
+        }
         return frag.value();
       }
     }
@@ -409,19 +414,28 @@ private:
     }
     const Array<PrimExpr> output_shape = layout->OutputShape();
     const int64_t *count = as_const_int(output_shape[0]);
-    ICHECK(count != nullptr && *count > 0)
-        << "[PlanPtoSlotStorage] fragment layout for buffer `" << fragment->name
-        << "` must have a constant positive entry count, "
-           "got "
-        << output_shape[0];
+    if (count == nullptr || *count <= 0) {
+      std::ostringstream oss;
+      oss << "[PlanPtoSlotStorage] fragment layout for buffer `"
+          << fragment->name << "` must have a constant positive entry "
+             "count, got "
+          << output_shape[0]
+          << "; use the canonical PTO form (floor-mod of exactly one input "
+             "dimension)";
+      LOG(FATAL) << oss.str();
+    }
     return *count;
   }
 
   static int64_t CheckedMul(int64_t count, int64_t lanes,
                             const Buffer &fragment) {
-    ICHECK(count <= std::numeric_limits<int64_t>::max() / lanes)
-        << "[PlanPtoSlotStorage] slot capacity for buffer `" << fragment->name
-        << "` overflows (" << count << " entries x " << lanes << " lanes)";
+    if (count > std::numeric_limits<int64_t>::max() / lanes) {
+      std::ostringstream oss;
+      oss << "[PlanPtoSlotStorage] slot capacity for buffer `"
+          << fragment->name << "` overflows (" << count << " entries x "
+          << lanes << " lanes); reduce the fragment shape or the lane width";
+      LOG(FATAL) << oss.str();
+    }
     return count * lanes;
   }
 };

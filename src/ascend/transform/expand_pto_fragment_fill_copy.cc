@@ -259,7 +259,9 @@ private:
     TileOperator tile_op = ParseOperator(fill_copy);
     ICHECK(tile_op.defined())
         << "[ExpandPtoFragmentFillCopy] internal error: " << name
-        << " call has no registered TileOperator builder";
+        << " call has no registered TileOperator builder"
+        << " (the op name matched the fill/copy filter but no builder was "
+           "registered — report this as a compiler bug)";
     // Unaligned fragment regions (min not a multiple of the lane width)
     // expand to the predicated whole-entry form; aligned ones keep the
     // plain MakeSIMTLoop shape. Both keep every access on whole entries
