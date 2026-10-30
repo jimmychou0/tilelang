@@ -41,11 +41,13 @@
 ### 1.2 为什么不能贪心：转置把选择锁死
 
 ```python
-f = T.alloc_fragment((128, 8))
-g = T.alloc_fragment((8, 128))
-for i, j in T.Parallel(128, 128):
+f = T.alloc_fragment((128, 8))     # f 的 dim1 只有 8
+g = T.alloc_fragment((8, 128))     # g 的 dim0 只有 8
+for i, j in T.Parallel(128, 8):    # 单元范围与两侧形状对齐：i<128、j<8
     g[j, i] = f[i, j] + 1.0        # 转置搬运，无其他访存
 ```
+
+（单元范围必须是 `128×8` 而不是 `128×128`：j 要同时落在 f 的 dim1（长 8）和 g 的 dim0（长 8）里，取大就越界——§13 例 2 的实测程序就是这个形状。）
 
 单元的 lane 维必须是某个循环变量。假设 j 当 lane：`f[i,j]` 要求 **f 的 lane 维 = dim1**（j 是 f 的第二维），同时 `g[j,i]` 要求 **g 的 lane 维 = dim0**（j 是 g 的第一维）。换 i 当 lane，两个都翻过来。也就是说：
 
@@ -85,7 +87,7 @@ f 单独挑"最省"、g 单独挑"最省"，会挑出矛盾组合。所以这题
 ```python
 f = T.alloc_fragment((128, 8))
 g = T.alloc_fragment((8, 128))
-for i, j in T.Parallel(128, 128):   # 一道 u 题
+for i, j in T.Parallel(128, 8):   # 一道 u 题
     g[j, i] = f[i, j] + 1.0         # 架起 u↔f、u↔g 两根杆
 ```
 
@@ -438,9 +440,9 @@ f = T.alloc_fragment((128, 8))
 g = T.alloc_fragment((8, 128))
 h = T.alloc_fragment((128, 8))
 
-for i, j in T.Parallel(128, 128):     # 单元1
+for i, j in T.Parallel(128, 8):     # 单元1
     g[j, i] = f[i, j] + 1.0           # 转置搬运 ⟹ f⊕g = 1
-for i, j in T.Parallel(128, 128):     # 单元2
+for i, j in T.Parallel(128, 8):     # 单元2
     h[i, j] = g[j, i] + 1.0           # 又一次转置 ⟹ g⊕h = 1
 ```
 
@@ -468,7 +470,7 @@ for i, j in T.Parallel(128, 128):     # 单元2
 往上面的程序再加一个单元，把 h 直接连回 f：
 
 ```python
-for i, j in T.Parallel(128, 128):     # 单元3
+for i, j in T.Parallel(128, 8):     # 单元3
     f[j, i] = h[i, j] + 1.0           # 第三次转置 ⟹ h⊕f = 1
 ```
 
