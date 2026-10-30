@@ -450,9 +450,55 @@ f = [128,8]、g = [8,128]、g[j,i]=f[i,j]：
 
 ## 8. Solve：带权并查集
 
-[Solve :1080](src/ascend/transform/pto_fragment_layout_solver.cc#L1080)：沿奇偶边做 XOR 传播 + 一元钉死；矛盾（节点被钉成两个值 / 奇环）→ 分类拒绝并附每边来源；自由分量按 §7.3 收尾。
+[Solve :1080](src/ascend/transform/pto_fragment_layout_solver.cc#L1080)。§7 的产物汇到这里：一堆变量（节点）、一堆 XOR 边（关系）、少量钉死值（锚）。Solve 回答三个问题：**有没有矛盾？锚住的块定值是多少？没锚的块选哪个根？**
 
-实现是经典带权并查集（[ParityDSU::Unite :406](src/ascend/transform/pto_fragment_layout_solver.cc#L406)），但有一个非显然的坑（修过的 P1-2，值得知道）：**合并两棵树时，旧根上钉的值必须迁移到新根**，否则那个值孤儿化——组件看起来无约束，构建结果取决于指针序（同样的程序两次编译选不同布局）。现在 `Unite` 迁移值并记录冲突来源，配合源码序规则，确定性有专门的回归用例钉住。
+### 8.1 先懂并查集本身（30 秒）
+
+并查集是管理"分组"的数据结构，只有两个动作：
+
+- **Unite(a, b)**：把 a、b 所在的两组合并成一组；
+- **Find(a)**：a 在哪组（返回组代表，即根）。
+
+实现是森林：每组的根当代表，每个节点记一个父指针。它不存任何组员名单——"同组"就是"Find 结果相同"。**带权（奇偶）并查集**在每个节点的父指针上多存一个数：**本节点取值 XOR 父节点取值**（[parity_ 数组](src/ascend/transform/pto_fragment_layout_solver.cc#L435)）。于是沿父链一路异或到根，就得到"任意节点与根的取值关系"——[Find :380](src/ascend/transform/pto_fragment_layout_solver.cc#L380) 返回的第二个出参就是它。
+
+### 8.2 三种产物怎么落进这棵树
+
+| §7 的产物 | DSU 操作 | 效果 |
+|---|---|---|
+| 奇偶边 `f⊕u = r` | `Unite(u, f, r)`：合并两组，且旧根到新根的边权设成让 `f⊕u` 恰好 = r 的值 | 同组 + 关系可查 |
+| 一元约束 `f = v` | [AddUnary :1050](src/ascend/transform/pto_fragment_layout_solver.cc#L1050)：`root_value_[Find(f) 的根] = v ⊕ (f 到根的奇偶)` | 整组被锚定 |
+| （查询）`f 到底是几` | `value(f) = root_value_[根] ⊕ parity_to_root` | 链上 XOR 一路算回来 |
+
+注意 AddUnary 的落点：**值记在根上，不是记在 f 上**——同一组共享一个锚值，各成员通过各自的 parity 换算出自己的值。这就是"钉死一块，全组连锁确定"的机制实现。
+
+### 8.3 完整走一遍转置例
+
+变量 u（单元）、f、g（两块 buffer）；§7.2 已推出边 `f⊕u=1`、`g⊕u=0`：
+
+```
+初始：u、f、g 各自成组（三棵单节点树，无值）
+
+Unite(u, f, 1)：合并 {u,f}；树形 u←f（边权1）或 f←u，组内任两点可查 XOR
+Unite(u, g, 0)：合并进 {u,f,g}
+结果：一组三个节点，查询自洽：
+   f⊕g = (f⊕u)⊕(u⊕g) = 1⊕0 = 1   ← 链上任意两点都能算
+
+没有 AddUnary → 整组无锚 → 自由分量 → 字节最小选根（§7.3）
+若用户 pinned f=1：AddUnary(f, 1) → root_value = 1⊕(f到根的奇偶)
+   → 查询 g = root_value ⊕ (g到根的奇偶) = 0   ← 全组连锁定值
+```
+
+### 8.4 矛盾怎么被发现（两条路）
+
+**路 1：AddUnary 撞值。** 对同一组先后钉两个值，换算到根上不等——第二个 [AddUnary 的 else 分支](src/ascend/transform/pto_fragment_layout_solver.cc#L1064)直接 Reject，报文带两条约束的来源（"『来源A』与『来源B』在同一组上不一致"）。典型成因：UB 把 u 钉成 0、用户注解把同一组的 f 钉成"只在 u=1 时才成立"的值。
+
+**路 2：Unite 出奇环。** 合并前两节点已在同组——`Unite` 不改树，只**校验**：把新边权和链上已算出的关系比对，不等即矛盾（[ra==rb 分支](src/ascend/transform/pto_fragment_layout_solver.cc#L413)返回 false）。图论上就是"绕一圈 XOR 和 = 1"的奇环。三个及以上 fragment 互相转置锁死时走这条。
+
+两条路都归为**已证明的布局冲突**（程序无解，不是求解器不行），分类拒绝。
+
+### 8.5 一个实现细节：根值迁移（确定性的关键）
+
+[Unite :406](src/ascend/transform/pto_fragment_layout_solver.cc#L406) 合并两棵树时，若**旧根上记着锚值**而它被摘下根位，值必须换算后搬到新根（`迁移值 = 旧值 ⊕ 新边权`）；不搬的话那个锚就孤儿化——组员看起来毫无约束，会被当成自由分量重新选根，**同样的程序两次编译选出不同布局**（历史上真实发生过，P1-2）。现在的实现迁移值、并在"两根都带值且不等"时置 conflicting_ 标志由下一次 AddUnary/Solve 兜底拒绝。它与源码序规则（§7.3）一起构成构建可复现性，有逐值断言 entry 数的确定性回归用例钉住。
 
 ---
 
