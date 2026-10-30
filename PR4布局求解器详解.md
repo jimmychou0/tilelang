@@ -202,6 +202,44 @@ j = q × VL + lane      q（chunk/轮次编号）= j ÷ VL 的商
 
 方向活过投票 A，还要问 fragment："按这个方向摆，你的每个访问表达得出来吗？"实现在 [FragmentDirectionFeasible :251](src/ascend/transform/pto_fragment_layout_solver.cc#L251)：在**候选规范布局**下代换，然后证三件事。它与 Verify 共用同一套证明思路（见 §10），域也相同。
 
+### 5.0 entry 和 storage_lane 是怎么算出来的（三件事的公共前置）
+
+5.1–5.3 证的两个对象——`storage_lane` 和 `entry`——不是凭空出现的，每个访存都走同一条三步流水线（[代码 :296-312](src/ascend/transform/pto_fragment_layout_solver.cc#L296)）：
+
+**第 1 步：按候选方向造布局公式**（[BuildCanonicalLayout :450](src/ascend/transform/pto_fragment_layout_solver.cc#L483)）。布局是两条关于"下标占位符"的公式模板（ph0/ph1 代表访问下标的第 0/1 维）：
+
+```
+storage_lane = ph[lane维] mod VL
+entry        = ph[lane维] ÷ VL  +  ph[其余维] × (lane维一侧的格子数 per_dim_entries)
+              └── lane 维内的格子号 ──┘ └── 其余维换算成格子 ──────────┘
+```
+
+**第 2 步：代换**（§3 的工具）：把访问下标里的循环变量换成 `q×VL + lane`。
+
+**第 3 步：套模板**：把代换后的下标填进占位符（coord_map + Substitute），化简得到这个访存在这个方向下的两条**具体表达式**——三件事证明对着的正是这两条式子。
+
+**完整算例**（sv3 的 `acc[i, j]`，acc = (8,128)，VL=128，候选方向 j 当 lane、即 lane 维=dim1，per_dim_entries = ceil(128/128) = 1）：
+
+```
+模板:  storage_lane = ph1 mod 128
+       entry        = ph1 ÷ 128 + ph0 × 1
+代换:  j = 0×128 + lane（j 只有 128 个，q 恒 0）
+填入:  ph0 = i, ph1 = lane
+结果:  storage_lane = lane mod 128 = lane          ← 5.1 证的就是它 == lane
+       entry        = lane ÷ 128 + i = 0 + i = i    ← 5.2/5.3 证的就是它
+```
+
+对照 §7 转换产物：Vectorize 发射的 `vstore(handle, i*128)` 里那个偏移 `i*128` 正是 `entry × VL`——**证明阶段算出的 entry 表达式，就是转换阶段直接拿来用的偏移公式**，这也是"证明在前、转换只填结果"的体现。
+
+反例同管线走一遍（`f[i, j*2]`，f=(8,256)，方向 j 当 lane、lane 维=dim1，per_dim_entries=ceil(256/128)=2）：
+
+```
+代换:  j*2 = 2×(q×128 + lane)
+填入:  storage_lane = (2q×128 + 2×lane) mod 128 = 2×lane mod 128   ← ≠ lane，5.1 立刻毙
+       entry = (2q×128+2×lane) ÷ 128 + i×2 = 2q + i×2（若 lane 部分除不尽则更糟）
+```
+
+
 ### 5.1 证明 (a)：存储位置 == 执行位置（lane 匹配）
 
 布局的正向映射给出：存储 lane = `下标[lane维] mod VL`。要求它恒等于执行 lane。
@@ -221,7 +259,7 @@ j = q × VL + lane      q（chunk/轮次编号）= j ÷ VL 的商
 
 ### 5.2 证明 (b)：entry 与 lane 无关
 
-entry 允许随**轮次**变（q、串行变量——每轮做不同 entry 天经地义），但一轮之内 128 条 lane 必须同属一个 entry：
+对 §5.0 算出的 entry 表达式（如 sv3 的 `entry = i`）：entry 允许随**轮次**变（q、串行变量——每轮做不同 entry 天经地义），但一轮之内 128 条 lane 必须同属一个 entry：
 
 ```
 entry = i     ┌──────────────────┐  128 lane 同住 entry 0 ✅
@@ -232,24 +270,61 @@ entry 依赖 lane ┌────┬────┬────┐   一轮内�
 
 用户程序很难直接写出违例（多数在 (a) 先死），这条是挡奇异手写 TIR 的保险丝。
 
-### 5.3 证明 (c)：entry 双侧区间
+### 5.3 证明 (c)：entry 双侧区间（entry 落在 fragment 的格子范围内）
 
-绑完全部范围后证 `0 ≤ entry < count`。**必须绑外层串行循环的范围**（`CollectEnclosingSerialRanges`，含 kernel 级、穿 if/while）——否则 `f[k,j]` 的 `entry = k < count` 永远证不出，合法程序被误拒。历史上两个真 bug 都在这：不绑 kernel 级循环（A4）、范围收集不穿 if（`for k: if…: f[k,j]`，P2-b）。
+**先讲 count 是什么。** fragment 的物理空间按 entry 划分成格子（§1.1 的图），count 是这块 fragment **总共有的格子数**。公式里两个成分对准 §1.1 的例子（`f = (8, 128)`，即 dim0 长 8、dim1 长 128，VL=128）：
 
-**为什么双侧**：只查上界，`f[j-VL]` 负偏移写到 backing **前面**的邻居 buffer；只查下界，`f[i+128]` 写到**后面**。都是静默内存破坏。
+| | 选法 A（j 维当 lane，即 dim1 是 lane 维） | 选法 B（i 维当 lane，即 dim0 是 lane 维） |
+|---|---|---|
+| **lane 维**（被向量宽度吃掉的那一维） | dim1，长 128 | dim0，长 8 |
+| **其余维**（没被吃掉的维，之积） | dim0，长 8 | dim1，长 128 |
+| `ceil(lane维长 / VL)`（lane 维占几个格子宽） | ceil(128/128) = **1** | ceil(8/128) = **1**（8 个采样补齐到 128） |
+| **count = 其余维积 × ceil(lane维/VL)** | 8 × 1 = **8 个格子** | 128 × 1 = **128 个格子** |
 
-实测报文（238）：
+公式的直观读法：**一格 = 沿 lane 维连续 VL 个元素**；lane 维长不够 VL 整除时，尾块也占一整格（ceil 的来历）；其余维的每一种下标组合各需要自己的一套格子，所以乘其余维积。ragged 例：`f = (4, 130)`@VL=64、lane 维=dim1：count = 4 × ceil(130/64) = 4 × **3** = 12（第 3 格只用 8 条 lane 也占整格）。
+
+代换后每个访存算出的 entry 表达式回答"这次访问落在第几格"。证明 (c) 要证的是：
+
+```
+0 ≤ entry < count
+```
+
+**为什么必须证这个：** entry 是数组下标——`vload/vstore(handle, entry×VL)` 会按 entry 索引 backing 存储。entry 越界就是数组越界，但它砸的不是自己：backing 排在统一 UB 地址空间里，**前面一格是别的 buffer，后面一格也可能是别的 buffer**——越界写 = 静默污染邻居的数据，不崩溃、无报错。所以这一证是纯安全检查，和"表达得出来"（证明 a/b）不同层。
+
+**怎么证明：** entry 是关于 `(q, lane, 保留变量, 外层串行变量)` 的表达式。lane 和 q 的范围求解器自己知道（`lane ∈ [0,VL)`、`q ∈ [0,轮数)`）；**外层串行变量（如 `for k in serial(K)` 的 k）的范围必须由收集器补上**（`CollectEnclosingSerialRanges`：沿函数体收集全部非常量界非 parallel 循环的范围，含 kernel 级、穿过 if/while）。范围齐了之后交给算术证明器算两个不等式：
+
+- 下界：`entry ≥ 0` —— 挡 `f[j - VL]` 这类负偏移（j 从 0 起时 entry = -1）；
+- 上界：`entry < count` —— 挡访问越过最后一格。
+
+**两个完整算例（正反各一）：**
+
+```
+正例：f = [4, 128]，方向 j=lane，访问 f[k, j]，k ∈ [0, 4)（范围已绑）
+    entry 表达式 = k
+    下界：k ≥ 0 ✅    上界：k < 4 = count ✅    → 放行
+
+反例：同一块 f，但 k ∈ [0, 8)（k 跑 8 次、f 只有 4 行）
+    entry = k，k=4..7 时 entry ≥ count
+    上界证不过 → 拒绝，报文原样带出表达式：
+    "the slot entry index (k) is not provably within [0, 4)"
+```
+
+```
+反例 2（多 chunk 上界）：f = [256]，VL=128，访问 f[i + 128]，i = q×128+lane
+    entry = (i+128) ÷ 128 = q + 1
+    q 的范围 [0, 2) 绑上后：q=1 时 entry = 2 = count → 上界失败 ❌
+    （q 范围不绑的话这个反例反而"证明通过"——漏判。所以
+      chunk 维的范围也必须绑全，这正是 1D 多 chunk 场景的坑）
+```
+
+**证不出 = 拒绝**（fail-closed）：证明器算不出来不等同于不越界，一律当不安全处理。代价是把个别实际安全的程序也拒了——如实登记（例如 `for k in serial(8): if k<4: f[k,j]`、f 只有 4 行：if 条件能推出 k<4，但范围收集不带条件分析，两侧一致拒绝，属保守行为非判定分裂）。
+
+实测报文（238）均含 entry 表达式原文，可直接对拍：
 
 ```text
-keep[k, j]，f 只有 4 行，k ∈ [0,8)：
-  "fragment buffer `keep` access (k, j) is not provable under the
-   vectorized coordinate `j`: the slot entry index (k) is not provably
-   within [0, 4)"                        ← 报文连 entry 表达式原样带出
-
-f[i+128]，f 是 [256]，i = q×128+lane：
-  entry = q+1，q=1 时 = count=2           ← "the slot entry index
-                                            (solver_lane // 128 + solver_q + 1)
-                                            is not provably within [0, 2)"
+keep[k, j]（f 4 行，k∈[0,8)）→ "the slot entry index (k) is not provably within [0, 4)"
+f[i+128]（f [256]）          → "the slot entry index (solver_lane//128 + solver_q + 1)
+                                is not provably within [0, 2)"
 ```
 
 ---
@@ -277,32 +352,99 @@ x_ub[k]             ✅(与lane无关)   —
 
 ## 7. 三种投票产物
 
+投票结束，每个单元产出下列之一（[ConstrainUnit 建边段 :991 起](src/ascend/transform/pto_fragment_layout_solver.cc#L991)）：
+
+```
+单元投票后状态                     产物
+─────────────────────────────    ─────────────────────────────
+只剩一个方向活 .................. 一元约束（钉单元 + 钉 fragment）
+两方向都活、钉出同一 lane 维 .... 一元约束（只钉 fragment，单元自由）
+两方向都活、钉出不同 lane 维 .... 奇偶边（谁也不钉，记锁链）
+该单元根本不碰 fragment ......... 无 fragment 产物（只有 UB 侧方向约束）
+```
+
 ### 7.1 一元约束（直接钉死）
 
-三种来源：只剩一个方向活（UB/证明毙了另一个）→ 钉单元；两方向殊途同归（1D fragment 只有一维）→ 只钉 fragment、单元保持自由；用户 `T.annotate_layout` 校验通过 → pinned。
+三种来源，各配算例：
+
+**来源 ①：单元被投票钉死**（UB 梳子/三件事毙掉一个方向）——单元和它碰到的 fragment 一起钉：
+
+```
+sv3 的 k 循环单元：
+  方向0(j=lane) 全票 ✅    方向1(i=lane) 死于 UB 梳子 ❌
+  ⟹ AddUnary(u=0)；且方向0 下 acc 的 lane 维=dim1 ⟹ AddUnary(acc=1)
+  （这也解释了 sv3 判词 forward_thread=_j）
+```
+
+**来源 ②：两方向殊途同归**（两个方向钉出**同一个** lane 维）——只钉 fragment，单元保持自由：
+
+```
+keep = [256]，单元访问 keep[i]（1D fragment 只有一维）：
+  方向0 下 lane 维 = dim0；方向1 下 lane 维 = dim0（1D 没得选）
+  ⟹ 只 AddUnary(keep=0)；u 不钉——单元切哪边这块 buffer 的摆法都一样
+```
+
+**来源 ③：用户 pinned**——`T.annotate_layout` 规范形态校验通过，直接作为一元约束进系统（校验细节见 §9）。
 
 ### 7.2 奇偶边（变量间的锁链）
 
-**触发条件精确**：单元两方向都活（UB 没约束它），且两个方向把同一块 fragment 钉到**不同** lane 维。这时谁也不能钉——钉哪个都等于替用户做了选择——只能记"这俩变量绑在一起变"。
+**触发条件**：单元两方向都活（UB 没约束它），且两个方向把同一块 2D fragment 钉到**不同** lane 维。这时谁也不能钉——钉哪个都等于替用户做了选择——只能记"这俩变量绑在一起变"。
 
-§1.2 的转置例：`f⊕u = 1`、`g⊕u = 0`（XOR 关系，`u` 被消掉后 **f⊕g = 1，f、g 必反向**，而 u 保持自由——单元切哪边都行，两块 buffer 必须一横一竖）。
+**边权（relation）怎么来的**：代码里就是 `Unite(u, f, relation = l_inner)`——`l_inner` 是**方向 0 下这块 fragment 的 dep-dim**（§6 选票表 continue 保证它被记录）。含义：`f 的取值 = u 的取值 XOR l_inner`。用 §2.1 转置例填一遍（`g[j,i] = f[i,j] + 1`）：
 
-**传递**是它的威力（三单元链：`f⊕g=1`、`g⊕h=1` ⟹ `f⊕h=0` 必同向）；**奇环**是它的矛盾检测（绕一圈 XOR 累加 = 1 ⟹ "f 与自己反向"⟹ 已证明布局冲突，报错带每条边的来源单元）。
+| | l_inner（方向0 下的 dep-dim） | 边 |
+|---|---|---|
+| f 的访问 `f[i,j]` | j 是 f 的 dim1 → l_inner(f)=1 | `f = u XOR 1`（u=0→f=1，u=1→f=0 ✅ 对上 §2.1 的表） |
+| g 的访问 `g[j,i]` | j 是 g 的 dim0 → l_inner(g)=0 | `g = u XOR 0`（g 与 u 同向） |
 
-**为什么"两方向都活"才出边**：单元被钉死的话 fragment 直接跟着定，发一元约束即可，不需要绕。奇偶边是"单元自己没想好、但不管它怎么想别的变量已有确定关系"的记账方式。
+**消元看连锁**：两条边拼起来 u 被消掉——
+
+```
+        f=1               g=0
+   f ─────── u(方向) ─────── g        （边上标的是 u=0 时的取值）
+   
+   u 随便选哪个，f⊕g 恒 = 1 ⟹ 两块 buffer 必须一横一竖，u 自由
+```
+
+**传递与矛盾**：链上任意两点的 XOR = 各边权异或。三单元链 `f──1──g──1──h` ⟹ `f⊕h=0`（f、h 必同向）；若某条链绕一圈回到自己且异或和 = 1（"f 与自己反向"），就是**已证明的布局冲突**——报错带每条边的来源单元（`dsu_->Unite` 返回 false 时 Reject）。
+
+**为什么"两方向都活"才出边**：单元已被钉死的话 fragment 跟着定，发来源①的一元约束即可。奇偶边是"单元自己没想好、但不管它怎么想，别的变量之间已有确定关系"的记账方式。
 
 ### 7.3 自由分量与字节最小
 
-没有被任何一元约束锚定的连通分量（含 floating 未访问 fragment）：每个分量只有"整组翻转"两个候选解，**按总字节数取小**：
+**分量是什么**：并查集传播完，图分成若干连通块；被一元约束锚住的块**唯一定值**；**没有任何一元约束碰过的块 = 自由分量**——可能是一个孤立 fragment（如只写不读、或 floating 未访问），也可能是一串只靠奇偶边相连的 fragment。
+
+**自由 ≠ 随便**：每个分量恰有两个候选解（整组翻转——选一个根值，链上其余变量由边权连锁确定）。比较两个解的**总字节数**：
 
 ```
-count = 其余维积 × ceil(lane维/VL)
-[128,4]@VL=128：dim0 当 lane → 4 entry；dim1 → 128 entry。取 dim0。
+单块字节数 = count × VL × 元素字节（32B 对齐）
+count     = 其余维积 × ceil(lane维/VL)        （§5.3 的公式）
+
+算例：f = [128, 4]@VL=128，f32（4 字节）
+  根值 f=0（dim0 当 lane）：count = 4×ceil(128/128) = 4  → 4×128×4B  = 2 KiB
+  根值 f=1（dim1 当 lane）：count = 128×ceil(4/128) = 128 → 128×128×4B = 64 KiB
+  取 f=0。32× 差距。
 ```
 
-字节最小同时是**容量侧防线**：`[256,4]` 落错维的 32× 膨胀布局从源头不再产生——否则预留失败的报错（"容量不足"）与根因（布局取向）错配，用户无从下手。
+**级联**：分量内一块定了，链上其余跟着翻——
 
-**仍并列**（如两个同形状 buffer 的转置对）→ **源码序第一个含自由方向的单元取内维**，整组随之确定。这条规则保证同样输入永远得到同样输出——它和 DSU 的值迁移修复（见 §8）一起，是"构建可复现"的两根桩。
+```
+分量 {f, g}（f⊕g=1）：根选 f=0 ⟹ g=1；根选 f=1 ⟹ g=0。
+两个解的总字节 = bytes(f=0)+bytes(g=1)  vs  bytes(f=1)+bytes(g=0)，取小。
+```
+
+**字节最小的双重身份**：除了紧凑，它还是**容量侧防线**——`[256,4]` 落错维的 32× 膨胀布局从源头不再产生。否则膨胀布局导致预留失败，报错是"容量不足"、根因是"布局取向"，用户无从下手（报错面与根因错配）。
+
+**仍并列怎么办**：两个解总字节相同（典型：两个同形状 buffer 的转置对，怎么翻都是一横一竖、总字节不变）→ **源码序第一个含自由方向的单元取内维（方向 0）**，整组随之确定：
+
+```
+f = [128,8]、g = [8,128]、g[j,i]=f[i,j]：
+  解A: f=1(8格), g=0(8格) → 总 16 格
+  解B: f=0(128格), g=1(128格) → 总 256 格   ← 取解A；不并列，字节最小直接定
+并列时（两解同字节）：源码序规则上场，输出恒定
+```
+
+这条规则 + §8 的 DSU 值迁移，是"构建可复现"的两根桩——同样输入永远得到同样布局（有专门的确定性回归用例逐值断言 entry 数）。
 
 ---
 
