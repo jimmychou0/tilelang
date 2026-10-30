@@ -504,31 +504,96 @@ Unite(u, g, 0)：合并进 {u,f,g}
 
 ## 9. PreScan 与 pinned 校验
 
-求解前的前扫描（[PreScan :624](src/ascend/transform/pto_fragment_layout_solver.cc#L624)），全部为分类拒绝或钉死：
+### 9.1 PreScan 是什么、为什么在求解**之前**
 
-| 检查 | 处理 |
+PreScan（[:624](src/ascend/transform/pto_fragment_layout_solver.cc#L624)）是求解前的**资格预审**：在开始建变量、投票之前，先把"求解器处理不了、或处理了也必然错"的程序形态挑出去，并把用户给的布局注解转成求解器的输入。它跑在 CollectRegions 之后、BuildConstraints 之前，理由很实际——
+
+- 这些检查**与方向选择无关**（不管怎么摆布局都非法），放在投票里逐方向重复查是浪费，而且报错会淹没在"无可行方向"里看不见真因；
+- pinned 注解必须在建约束**之前**变成一元约束（§8.2），否则求解器无从知道用户的意图。
+
+一句话：**PreScan 管"这道题该不该进求解器、带什么前提进"，投票管"进了之后选哪个答案"。**
+
+### 9.2 五项检查逐个讲
+
+**① kernel 级注解 → 规范形态校验 → pinned。** 用户在 kernel 作用域 `T.annotate_layout({f: 布局})` 明说"f 就这么摆"。求解器不直接信任——先校验布局是**规范形态**，三条各挡一种错：
+
+| 规范形态要求 | 挡什么 |
 |---|---|
-| kernel 级 `T.annotate_layout` 规范形态（恰一 entry 维、replicate==1、lane 为 floor-mod） | 校验通过 → pinned 一元约束 |
-| SimdVF 作用域内注解 | 会挂 kernel 块按 kernel 级 pinned 接受（DSL 构造不出专属形态，登记差异） |
-| fragment 在转换区域之外被访问 / 被两个区域使用 / 多 fragment 共享 data Var | 分类拒绝 |
-| 无 PTO 契约的 TileOp 碰 fragment（含 fragment 上的 direct reduce） | 拒绝 |
+| 恰一个 entry 维（forward_index 恰一条） | 多维 entry 的布局没有对应的格子模型（§5.3 的 count 算不出来） |
+| replicate == 1 | 复制型布局（每线程一份）是 PR-6 的广播语义，本求解器不建模型 |
+| lane 是 floor-mod 形态（`forward_thread = 下标 mod VL`） | 任意映射（如 hash）没有"lane 维"可言，§2 变量模型失效 |
 
-pinned 的字段校验有一段历史教训：曾用自写比较只查 InputShape/forward_thread/forward_index **长度**，`forward_index=[i//2]` 这类**非单射映射**能混过、静默元素别名。现在 InputShape 逐维相等**前置** + 调用完整 `FragmentNode::IsEqual`（比 thread_range/OutputShape/replicate/forward 映射**内容**）——前置的原因：IsEqual 对 shape 不等的输入故意返回 true（SIMT 广播复用），单用会放过错形注解。
+通过 → 作为一元约束进 §8（这就是 §7.1 来源③）；不通过 → 分类拒绝并提示"改注解或去掉"。
+
+**② SimdVF 作用域内的注解 → 拒绝。** 写在 `with T.SimdVF:` 里的注解会被前端挂到 kernel 块上（引擎对区域级注解静默忽略），用户以为"只对这个区域生效"，实际语义不明。直接拒，报错说明注解位置错了。
+
+**③ 区域外访问 → 拒绝。** fragment 的整套机制（布局、backing、转换）都以**转换区域**为单位；在区域外读 fragment（kernel 作用域、无 Parallel 的 SimdVF 里）意味着布局管不到它——值可能没初始化、backing 可能没声明。报错原文："every fragment access of a PTO kernel must live inside a converting T.Parallel body"。
+
+**④ 跨区域使用 → 拒绝。** 同一块 fragment 被两个 SimdVF 区域访问：两个区域各自声明 handle、各自转换，但 backing 是一份——两边的写入顺序、entry 约定都无法跨区域保证。报错点名两个区域的序号。
+
+**⑤ 同 data Var 多视图 → 拒绝。** 两块 fragment Buffer 共享同一底层分配（视图）：`g = f.view(...)` 类。两块 buffer 会被当成独立变量各选布局（§2），但对同一块内存——一个选横一个选竖就是静默数据破坏。当前按对象身份拒绝（结构完全相同的重复对象视为同一）；"结构归一"（形状/stride/offset 全同即同一）登记为后续增强。
+
+（另有**无契约 TileOp 碰 fragment → 拒绝**：fill/copy 已被 §3 展开、reducer 走 PR-6 契约，剩下到这里的 TileOp 一律没有与 fragment 存储的配合协议。）
+
+### 9.3 pinned 校验怎么比对（机制，非历史）
+
+注解布局要和**该 buffer 的规范形态**比对——不是比"合法"，是比"和求解器自己会选的形状完全一致"。分两步（[:786 起](src/ascend/transform/pto_fragment_layout_solver.cc#L786)）：
+
+```
+第 1 步（前置）：InputShape 逐维 CanProveEqual 相等
+第 2 步：调用 FragmentNode::IsEqual —— 比 thread_range / OutputShape /
+         replicate / ThreadExtent / forward 映射内容（用公共变量替换后
+         逐表达式比较，防 AST 形状不同但数学相同被误判）
+```
+
+为什么两步缺一不可：`IsEqual` 对 **shape 不等**的输入**故意返回 true**（SIMT 世界里允许广播复用不同形状的布局）——单用第 2 步，`[128,4]` 的注解能钉到 `[128,8]` 的 buffer 上，count 全错。反过来只做逐字段自写比较（历史实现）会漏比 forward 映射的**内容**——`forward_index = [i//2]` 这种**非单射**映射（两个逻辑元素映射进同一格 = 静默别名）长度对、形状对、就是映射本身非法。两步合起来：形状先卡死，再比全部字段内容。
 
 ---
 
 ## 10. 一个证明，两个消费者（最重要的不变量）
 
-求解器投票（候选布局下试探"这个方向证得过吗"）与 Verify 放行（最终布局下复核"选出来的方向真的证得过吗"）调用**同一个** `AnalyzeFragmentAccess`（[parallel_to_pto_utils.cc:639](src/ascend/transform/parallel_to_pto_utils.cc#L639)）、绑**同一套**范围集（`CollectEnclosingSerialRanges` :93 共享）：
+### 10.1 为什么会有两个消费者
+
+同一个"访存合法性"问题，编译流程里有**两个时刻**要问它：
+
+| 时刻 | 谁在问 | 问法 | 用答案干什么 |
+|---|---|---|---|
+| 布局求解时（§5） | 求解器投票 | "**如果**按这个候选方向摆，这个访存证得过吗？"（试探——布局还没定，两方向各问一遍） | 筛掉不可行方向（§6 选票表） |
+| 转换前（Vectorize 之前） | Verify 安检门 | 求解器选出的**最终布局**下，每个访存证得过吗？（复核——此刻布局已注入、程序即将被改写） | 全过才放行到 Vectorize |
+
+两个时刻问的是**同一道题**（同一个访存、同一条 entry/lane 公式、同三件事），只是前提（候选 vs 最终布局）不同。既然是同一道题，就该只有一个答案函数——于是两边调用**同一个** `AnalyzeFragmentAccess`（[utils :639](src/ascend/transform/parallel_to_pto_utils.cc#L639)；求解器侧经 `FragmentDirectionFeasible` 传候选布局，Verify 侧 [:1105](src/ascend/transform/verify_parallel_to_pto.cc#L1105) 传注入后的布局）：
 
 ```
                  AnalyzeFragmentAccess（唯一实现）
-                   ↑                    ↑
+                   ↑ 传候选布局            ↑ 传最终布局
         求解器 FragmentDirectionFeasible    VerifyParallelToPTO
         "选方向时筛不可行项"                 "放行前复核"
 ```
 
-**判定不可能分叉**。若各写一套（历史上出现过），"求解器放行 Verify 拒"（误拒）或反过来（静默算错温床）都可能出现。附带好处：求解器先执行 → 同类非法程序的报错点固定在求解器、文案稳定可测试（改测试断言时就靠这个确定性）。
+### 10.2 "同一套范围集"为什么也是不变量的一半
+
+证明 (c) 要绑外层串行变量的范围（§5.3）。两边绑的范围必须**逐个相同**——否则即使证明函数只有一个，输入不同照样分叉。所以范围收集也只有一份实现（`CollectEnclosingSerialRanges`，utils :93），两边都调它：求解器在 AddRegion 时给每个单元收集（[unit.outer_ranges](src/ascend/transform/pto_fragment_layout_solver.cc#L122)），Verify 的 visitor 自己遍历时同样收集（[:510 起](src/ascend/transform/verify_parallel_to_pto.cc#L510)——进一个串行循环压一层范围、出来弹掉）。分叉会是什么样，拿 `f[k, j]` 演示：
+
+```
+假设（反例）求解器绑了 k∈[0,4)、Verify 没绑：
+  求解器：entry=k ∈ [0,4) ✅ 选定方向
+  Verify：entry=k 无范围 → 证不出 < count ❌ 拒绝
+  → 求解器放行、Verify 拒 = 同一程序时好时坏（误拒）
+反方向的不对称更危险：求解器没绑（拒绝）、Verify 绑了（通过）
+不会发生——求解器在流水线前面，它拒了就到不了 Verify；
+真正要防的是上面那种"前面放行、后面拒绝"，以及更糟的
+"两边证明函数不同导致某访问一边证得出一边证不出"
+```
+
+### 10.3 分叉的实际危害与"求解器先报"的好处
+
+历史上两边各写过一套证明，出现过"求解器放行、Verify 拒"（用户程序时灵时不灵）——这是误拒；反过来"求解器拒、Verify 本该放"会错杀合法程序；最危险的是两边对**同一个访问**得出不同 entry 表达式却都各自通过——那是静默算错的温床。统一实现后这些类别整体消失。
+
+附带一个工程好处：求解器在流水线上先执行，同类非法程序的报错点**固定在求解器**、文案稳定——测试可以直接断言报错原文（本求解器的负例测试全部如此），不会因为某次重构挪动了 pass 顺序就变成 Verify 的另一套文案。
+
+### 10.4 Verify 不是求解器的复读机
+
+Verify 复核之外还有自己的独立职责（求解器不做的）：跨 SIMD_VF 共享 fragment 的拒绝、lane 偏移/区域级提取的拒绝、UB 侧访存的连续性分类（`AnalyzeBufferAccess`，同一文件里证明的 UB 版）。所以它是一道完整的安检门，"共用证明"只是两者重叠的那部分——重叠部分共用，专属部分各管各的。
 
 ---
 
