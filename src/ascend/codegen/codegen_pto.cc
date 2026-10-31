@@ -5542,14 +5542,6 @@ void CodeGenTileLangPTO::PrintPtoMemrefDeclare_(const CallNode *op,
 
 namespace {
 
-// The size annotation of a tl.vmi call (the vector lane count).
-int64_t VmiSizeOf_(const CallNode *op) {
-  auto it = op->annotations.find("size");
-  ICHECK(it != op->annotations.end()) << "tl.vmi call requires a size";
-  const auto *size = (*it).second.as<IntImmNode>();
-  ICHECK(size != nullptr) << "tl.vmi size annotation must be an integer";
-  return size->value;
-}
 }  // namespace
 
 void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,

@@ -218,7 +218,8 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
       // row-major offset — a fragment's logical strides say nothing about
       // its backing (the layout solver owns them). The entry interval was
       // already proven when the layout was solved.
-      if (fragment_layouts != nullptr) {
+      if (fragment_layouts != nullptr &&
+          access.buffer.scope() == "local.fragment") {
         auto fit = fragment_layouts->find(access.buffer);
         if (fit != fragment_layouts->end()) {
           const auto *frag = (*fit).second.as<FragmentNode>();

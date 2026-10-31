@@ -350,7 +350,7 @@ private:
     return rebuilt;
   }
 
-  // Convert one SIMD_VF region body: mask plan, slot state, carry promotion,
+  // Convert one SIMD_VF region body: mask plan, slot state, 
   // units.
   Stmt ConvertRegionBody(const Stmt &region) {
     // Reset the region-level slot state: every local.fragment buffer of
@@ -428,11 +428,6 @@ private:
       // by the device suites.
       new_region = ReplaceStmt(new_region, scan.units[i], converted);
     }
-    if (region_carry_.active) {
-      new_region = SeqStmt::Flatten(AllocBuffer(region_carry_.vreg),
-                                    new_region);
-      region_carry_ = RegionCarry();
-    }
     CheckNoResidualFragmentAccess(new_region);
     CheckSlotDeclarations(new_region);
     return new_region;
@@ -457,8 +452,11 @@ private:
   // (innermost first — the converting block itself and its ancestors; both
   // PlanPtoSlotStorage and the layout writeback place them there).
   void BuildSlotState() {
+    // slot_map_ is region-specific (rebuilt per converting region).
+    // converted_fragments_ accumulates across regions within one kernel
+    // scope so the kernel-scope block cleanup sees every consumed
+    // allocation, not just the last region's.
     slot_map_.clear();
-    converted_fragments_.clear();
     for (auto it = block_stack_.rbegin(); it != block_stack_.rend(); ++it) {
       auto plans_value = (*it)->annotations.Get(kPtoSlotPlan);
       if (!plans_value.has_value()) {
@@ -591,18 +589,18 @@ private:
       }
       allocs.push_back(buffer);
     }
-    Map<Var, Layout> layouts;
+    LayoutMap layouts;
     bool layout_changed = false;
     if (auto anno = original->annotations.Get(attr::kLayoutMap);
         anno.has_value()) {
-      if (auto map = anno.value().try_cast<Map<Var, Layout>>();
+      if (auto map = anno.value().try_cast<LayoutMap>();
           map.has_value()) {
-        for (const auto &[var, layout] : map.value()) {
-          if (converted_fragments_.count(var.get()) != 0) {
+        for (const auto &[buffer, layout] : map.value()) {
+          if (converted_fragments_.count(buffer->data.get()) != 0) {
             layout_changed = true;
             continue;
           }
-          layouts.Set(var, layout);
+          layouts.Set(buffer, layout);
         }
       }
     }
@@ -653,12 +651,14 @@ private:
       handle_plans_.emplace(state.handle.get(), state.plan);
     }
     const auto *scope_attr = region.as<AttrStmtNode>();
-    if (scope_attr != nullptr && scope_attr->attr_key == "tl.simdvf_scope") {
-      return AttrStmt(scope_attr->node, scope_attr->attr_key,
-                      scope_attr->value,
-                      SeqStmt::Flatten(std::move(binds), scope_attr->body));
-    }
-    return SeqStmt::Flatten(std::move(binds), region);
+    ICHECK(scope_attr != nullptr && scope_attr->attr_key == "tl.simdvf_scope")
+        << "[VectorizeParallelToPTO] internal error: the converting region "
+           "body is not wrapped by tl.simdvf_scope — declare_fragment_buffer "
+           "must bind inside the vecscope (VPTO rejects cross-scope "
+           "references)";
+    return AttrStmt(scope_attr->node, scope_attr->attr_key,
+                    scope_attr->value,
+                    SeqStmt::Flatten(std::move(binds), scope_attr->body));
   }
 
   // Post-check: every local.fragment access of the region went through the
@@ -997,284 +997,6 @@ private:
     return body;
   }
 
-  // ------------------------------------------------------------------
-  // Loop shells (constant-bound T.serial inside T.Parallel, admitted by
-  // Verify). AnalyzeLoopShell runs per unit before conversion. The shell
-  // itself is always preserved as a scalar loop; when the canonical
-  // carry pattern matches, the carried value is promoted to a local.var
-  // vreg buffer (the UB round-trip is not order-safe on the current
-  // PTOAS: no automatic mem_bar between the carried vstore and the next
-  // iteration's vload). A shell whose body both reads and writes a
-  // buffer through UB without matching the pattern would silently read
-  // stale values, so it is rejected instead.
-  // ------------------------------------------------------------------
-  static void FlattenStmts(const Stmt &stmt, std::vector<Stmt> *out) {
-    if (const auto *seq = stmt.as<SeqStmtNode>()) {
-      for (const auto &s : seq->seq) {
-        FlattenStmts(s, out);
-      }
-      return;
-    }
-    out->push_back(stmt);
-  }
-
-  class ShellAccessCollector : public StmtExprVisitor {
-  public:
-    struct Access {
-      const BufferNode *buf;
-      Array<PrimExpr> indices;
-      bool is_store;
-    };
-    std::vector<Access> accesses;
-    std::vector<const VarNode *> loop_vars;
-    void VisitStmt_(const BufferStoreNode *op) final {
-      accesses.push_back({op->buffer.get(), op->indices, true});
-      StmtExprVisitor::VisitStmt_(op);
-    }
-    void VisitExpr_(const BufferLoadNode *op) final {
-      accesses.push_back({op->buffer.get(), op->indices, false});
-      StmtExprVisitor::VisitExpr_(op);
-    }
-    void VisitStmt_(const ForNode *op) final {
-      loop_vars.push_back(op->loop_var.get());
-      StmtExprVisitor::VisitStmt_(op);
-    }
-  };
-
-  class BufferAccessCounter : public StmtExprVisitor {
-  public:
-    explicit BufferAccessCounter(const BufferNode *buf) : buf_(buf) {}
-    void VisitStmt_(const BufferStoreNode *op) final {
-      if (op->buffer.get() == buf_) {
-        ++count_;
-      }
-      StmtExprVisitor::VisitStmt_(op);
-    }
-    void VisitExpr_(const BufferLoadNode *op) final {
-      if (op->buffer.get() == buf_) {
-        ++count_;
-      }
-      StmtExprVisitor::VisitExpr_(op);
-    }
-    int count_ = 0;
-
-  private:
-    const BufferNode *buf_;
-  };
-
-  [[noreturn]] void ShellFail(const std::string &message) {
-    LOG(FATAL) << "[VectorizeParallelToPTO] loop shell: " << message;
-  }
-
-  bool IsCarryAccess(const Buffer &buf, const Array<PrimExpr> &indices) const {
-    if (!carry_src_.defined() || !buf->data.same_as(carry_src_->data)) {
-      return false;
-    }
-    if (carry_lane_var_match_) {
-      // Region-level promotion: every unit has its own Parallel loop var, so
-      // the carried access is "this buffer, indexed by a single lane Var".
-      return indices.size() == 1 && indices[0].as<VarNode>() != nullptr;
-    }
-    if (indices.size() != carry_indices_.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < indices.size(); ++i) {
-      if (!ffi::StructuralEqual()(indices[i], carry_indices_[i])) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  void AnalyzeLoopShell(const Stmt &unit_body, const Stmt &region_body) {
-    carry_seed_ = nullptr;
-    carry_loop_ = nullptr;
-    carry_src_ = tirx::Buffer();
-    carry_vreg_ = tirx::Buffer();
-    carry_indices_ = Array<PrimExpr>();
-    carry_active_ = false;
-
-    std::vector<Stmt> stmts;
-    FlattenStmts(unit_body, &stmts);
-    const ForNode *shell = nullptr;
-    size_t shell_pos = 0;
-    for (size_t i = 0; i < stmts.size(); ++i) {
-      if (const auto *f = stmts[i].as<ForNode>()) {
-        if (f->kind == ForKind::kSerial) {
-          if (shell != nullptr) {
-            ShellFail("only one T.serial loop per T.Parallel unit is "
-                      "supported at this stage");
-          }
-          shell = f;
-          shell_pos = i;
-        }
-      }
-    }
-    if (shell == nullptr) {
-      return; // no shell in this unit
-    }
-
-    ShellAccessCollector collector;
-    collector(shell->body);
-    // Buffers the shell both reads and writes through memory — the
-    // cross-iteration dependencies.
-    std::unordered_map<const BufferNode *, std::pair<int, int>> counts;
-    for (const auto &acc : collector.accesses) {
-      // A per-lane scalar is a register, not a memory carry: its in-shell
-      // update is promoted to the vreg by ConvertBody, so it never needs a
-      // UB round-trip promotion (and must not be counted as the carried
-      // buffer, whose post-shell isolation check would then reject the
-      // legitimate reads of the final value).
-      if (pto_analysis::IsLaneScalarBuffer(GetRef<Buffer>(acc.buf))) {
-        continue;
-      }
-      // Fragment buffers follow the same rule as the region-level carry
-      // analysis and the vecscope split: their in-shell read-modify-write
-      // goes through the slot backing (toolchain-ordered), and promoting
-      // them to a carry vreg would both split the slot read/write path and
-      // leave the writeback storing a never-written vreg into the
-      // fragment through the plain UB path (B2).
-      if (GetRef<Buffer>(acc.buf).scope() == "local.fragment") {
-        continue;
-      }
-      auto &c = counts[acc.buf];
-      if (acc.is_store) {
-        ++c.second;
-      } else {
-        ++c.first;
-      }
-    }
-    const BufferNode *carried = nullptr;
-    for (const auto &kv : counts) {
-      if (kv.second.first > 0 && kv.second.second > 0) {
-        if (carried != nullptr) {
-          ShellFail("the T.serial loop reads and writes more than one "
-                    "buffer; only a single carried buffer is supported at "
-                    "this stage");
-        }
-        carried = kv.first;
-      }
-    }
-    if (carried == nullptr) {
-      // Shell without a memory-carried value: plain preservation has no
-      // cross-iteration write->read through UB to order.
-      return;
-    }
-
-    // Every access of the carried buffer inside the shell must use one
-    // index set (structurally equal, independent of every loop
-    // variable), with exactly one store.
-    std::vector<const ShellAccessCollector::Access *> carried_accesses;
-    for (const auto &acc : collector.accesses) {
-      if (acc.buf == carried) {
-        carried_accesses.push_back(&acc);
-      }
-    }
-    int carried_stores = 0;
-    for (const auto *acc : carried_accesses) {
-      if (acc->is_store) {
-        ++carried_stores;
-      }
-    }
-    if (carried_stores != 1) {
-      ShellFail("the carried buffer must have exactly one store inside the "
-                "T.serial loop");
-    }
-    const Array<PrimExpr> &ref = carried_accesses[0]->indices;
-    for (const auto *acc : carried_accesses) {
-      if (acc->indices.size() != ref.size()) {
-        ShellFail("all carried accesses must use the same index");
-      }
-      for (size_t i = 0; i < ref.size(); ++i) {
-        if (!ffi::StructuralEqual()(acc->indices[i], ref[i])) {
-          ShellFail("all carried accesses must use the same index");
-        }
-      }
-    }
-    std::vector<const VarNode *> loop_vars = collector.loop_vars;
-    loop_vars.push_back(shell->loop_var.get());
-    for (const auto &idx : ref) {
-      for (const VarNode *lv : loop_vars) {
-        if (tirx::UsesVar(idx, [lv](const VarNode *v) { return v == lv; })) {
-          ShellFail("the carried index must not depend on the loop "
-                    "variable");
-        }
-      }
-    }
-
-    // The seed: a store to the carried buffer, immediately before the
-    // shell, whose value does not read the carried buffer.
-    if (shell_pos == 0) {
-      ShellFail("the loop carry needs a seed store to the carried buffer "
-                "immediately before the T.serial loop");
-    }
-    const auto *seed = stmts[shell_pos - 1].as<BufferStoreNode>();
-    if (seed != nullptr && seed->predicate.defined()) {
-      ShellFail("the seed store of the carried buffer must be "
-                "unconditional; a conditional seed cannot be promoted to a "
-                "register and has no ordered UB form inside a vecscope");
-    }
-    if (seed == nullptr || seed->buffer.get() != carried ||
-        seed->indices.size() != ref.size()) {
-      ShellFail("the loop carry needs a seed store to the carried buffer "
-                "immediately before the T.serial loop");
-    }
-    for (size_t i = 0; i < ref.size(); ++i) {
-      if (!ffi::StructuralEqual()(seed->indices[i], ref[i])) {
-        ShellFail("the seed store must use the same index as the carried "
-                  "accesses");
-      }
-    }
-    class SeedReadsCarried : public StmtExprVisitor {
-    public:
-      explicit SeedReadsCarried(const BufferNode *buf) : buf_(buf) {}
-      void VisitExpr_(const BufferLoadNode *op) final {
-        if (op->buffer.get() == buf_) {
-          reads_ = true;
-        }
-        StmtExprVisitor::VisitExpr_(op);
-      }
-      bool reads_ = false;
-
-    private:
-      const BufferNode *buf_;
-    };
-    SeedReadsCarried seed_check(carried);
-    seed_check(seed->value);
-    if (seed_check.reads_) {
-      ShellFail("the seed value must not read the carried buffer");
-    }
-
-    // Isolation: the carried buffer must not be accessed anywhere else
-    // in the region (every other access would observe the eliminated
-    // round-trip). The pattern's own accesses are the seed plus the
-    // in-shell ones; the post-shell writeback is emitted, not counted.
-    BufferAccessCounter region_count(carried);
-    region_count(region_body);
-    if (region_count.count_ !=
-        static_cast<int>(carried_accesses.size()) + 1) {
-      ShellFail("the carried buffer must only be accessed by the seed "
-                "store and the T.serial loop in this SIMD_VF region");
-    }
-
-    carry_seed_ = seed;
-    carry_loop_ = shell;
-    carry_src_ = GetRef<Buffer>(carried);
-    carry_indices_ = ref;
-    carry_vreg_ = tirx::decl_buffer(
-        {IntImm(DataType::Int(32), 1)},
-        VectorDType(carried->dtype, lanes_),
-        std::string(carried->name) + "_carry", "local.var");
-  }
-
-  Stmt WrapCarryAlloc(Stmt s) {
-    if (carry_vreg_.defined()) {
-      return SeqStmt::Flatten(AllocBuffer(carry_vreg_), std::move(s));
-    }
-    return s;
-  }
-
-  // ------------------------------------------------------------------
   // Per-lane scalar promotion (`T.alloc_var` in a Parallel unit)
   // ------------------------------------------------------------------
   // `T.alloc_var(dtype)` is a single-element `local.var` buffer. Every lane
@@ -1304,332 +1026,9 @@ private:
       s = SeqStmt::Flatten(AllocBuffer(*it), std::move(s));
     }
     lane_scalar_allocs_.clear();
-    if (unit_carry_from_region_) {
-      carry_active_ = false;
-      return s;
-    }
-    return WrapCarryAlloc(std::move(s));
+    return s;
   }
 
-  // The shell's own stores were eliminated by promotion; publish the
-  // final carry value back to the source buffer once, after the shell.
-  Stmt EmitCarryWriteback() {
-    ICHECK(carry_src_.scope() != "local.fragment")
-        << "[VectorizeParallelToPTO] internal error: a local.fragment "
-           "buffer must never be a carry source (see AnalyzeLoopShell)";
-    auto access = pto_analysis::AnalyzeBufferAccess(
-        carry_src_, carry_indices_, /*is_write=*/true, loop_var_,
-        CurrentMapping(), &analyzer_, bind_env_);
-    ICHECK(access.pattern == pto_analysis::AccessPattern::kContinuous)
-        << "[VectorizeParallelToPTO] internal error: the carry writeback "
-           "address is not continuous";
-    Array<PrimExpr> start_idx;
-    for (const auto &idx : access.start_indices) {
-      start_idx.push_back(
-          analyzer_.Simplify(BindChunkToQ(SubstituteLaneZero(idx))));
-    }
-    PrimExpr ptr =
-        Call(DataType::Handle(), tl::access_ptr(),
-             {BufferLoad(carry_src_, start_idx),
-              IntImm(DataType::Int(32), static_cast<int>(lanes_)),
-              IntImm(DataType::Int(32), 2)});
-    return Evaluate(Call(
-        DataType::Void(), VmiOp("vstore"),
-        {BufferLoad(carry_vreg_, {make_zero(DataType::Int(32))}), ptr,
-         IntImm(DataType::Int(32), 0), mask_var_}));
-  }
-
-  // ------------------------------------------------------------------
-  // Region-level carry promotion (serial loop WRAPPING Parallel units).
-  //
-  // Inside one vecscope a UB read-modify-write chain has no ordering
-  // point: every sync operation delimits a vecscope, so none can appear
-  // between two iterations. An accumulator updated that way keeps reading
-  // its seed or a partially updated value, and the outcome depends on the
-  // trip count and on backend scheduling. Promoting the accumulator to a
-  // local.var vreg makes the loop carry an SSA value (scf.for iter_args),
-  // so no memory ordering is needed at all.
-  //
-  // Recognised shape (deliberately narrow, mirroring AnalyzeLoopShell):
-  //   <unit S>: B[lane] = seed            (right before the loop, no B read)
-  //   for t in serial(G):
-  //     <unit U>: ... = B[lane] ... B[lane] = f(...)   (one store, same index)
-  // with B a 1-D shared buffer of exactly one lane vector (lanes elements),
-  // and no other unit in the region touching B.
-  // ------------------------------------------------------------------
-  static bool StmtHasFor(const Stmt &s, const ForNode *target) {
-    bool found = false;
-    PostOrderVisit(s, [&](const ObjectRef &n) {
-      if (n.get() == target) {
-        found = true;
-      }
-    });
-    return found;
-  }
-
-  // Flatten the *top level* of a region body, looking through the AttrStmt
-  // (simdvf scope) and SBlock wrappers that the region may carry.
-  static void FlattenTopStmts(const Stmt &stmt, std::vector<Stmt> *out) {
-    if (const auto *seq = stmt.as<SeqStmtNode>()) {
-      for (const auto &s : seq->seq) {
-        FlattenTopStmts(s, out);
-      }
-      return;
-    }
-    if (const auto *attr = stmt.as<AttrStmtNode>()) {
-      FlattenTopStmts(attr->body, out);
-      return;
-    }
-    if (const auto *blk = stmt.as<SBlockNode>()) {
-      FlattenTopStmts(blk->body, out);
-      return;
-    }
-    out->push_back(stmt);
-  }
-
-  struct RegionCarry {
-    bool active = false;
-    const ForNode *loop = nullptr;
-    const ForNode *seed = nullptr;
-    tirx::Buffer src{};
-    Array<PrimExpr> indices{};
-    tirx::Buffer vreg{};
-    PrimExpr seed_value{};
-  };
-
-  // Try to promote one candidate loop; returns true when the canonical
-  // carried-buffer pattern matches.
-  bool TryRegionCarry(const ForNode *loop, const std::vector<Stmt> &stmts,
-                      const pto_analysis::PtoRegionScan &scan, int64_t lanes,
-                      RegionCarry *out) {
-    const ForNode *first = nullptr;
-    for (const For &u : scan.units) {
-      if (StmtHasFor(loop->body, u.get())) {
-        first = u.as<ForNode>();
-        break;
-      }
-    }
-    if (first == nullptr) {
-      return false;
-    }
-
-    // Carried buffer: the single shared buffer that the first in-loop unit
-    // both reads and writes, with exactly one store.
-    ShellAccessCollector acc;
-    acc(static_cast<const Stmt &>(first->body));
-    const BufferNode *carried = nullptr;
-    Array<PrimExpr> indices;
-    for (const auto &a : acc.accesses) {
-      if (!a.is_store) {
-        continue;
-      }
-      // Fragment buffers never participate in region carry promotion:
-      // their value lives in the slot backing and is ordered by the
-      // backing (toolchain-ordered), not by the carry vreg. Promoting a fragment
-      // into a vreg while loads still go through the backing would
-      // split the read/write path (B2).
-      if (GetRef<Buffer>(a.buf).scope() == "local.fragment") {
-        continue;
-      }
-      bool also_read = false;
-      for (const auto &b : acc.accesses) {
-        if (!b.is_store && b.buf == a.buf &&
-            ffi::StructuralEqual()(b.indices, a.indices)) {
-          also_read = true;
-          break;
-        }
-      }
-      if (!also_read) {
-        continue;
-      }
-      if (carried != nullptr && carried != a.buf) {
-        return false;  // more than one candidate
-      }
-      carried = a.buf;
-      indices = a.indices;
-    }
-    if (carried == nullptr || indices.size() != 1 ||
-        indices[0].as<VarNode>() == nullptr) {
-      return false;
-    }
-    // Full lane width, single chunk.
-    if (carried->shape.size() != 1) {
-      return false;
-    }
-    const auto *extent = carried->shape[0].as<IntImmNode>();
-    if (extent == nullptr || extent->value != lanes) {
-      return false;
-    }
-
-    // Every in-loop unit updates the same buffer at a single lane index.
-    for (const For &u : scan.units) {
-      if (!StmtHasFor(loop->body, u.get())) {
-        continue;
-      }
-      ShellAccessCollector ua;
-      ua(static_cast<const Stmt &>(u.as<ForNode>()->body));
-      // The carried index must be this unit's own lane variable. A bare Var is
-      // not enough: `m_ub[t]` (t an enclosing serial variable) is also a
-      // single-Var index and passes Verify as a lane-uniform load, but
-      // redirecting it to the vreg would turn one lane's value into a
-      // whole-vector read — a silent semantic error.
-      std::set<const VarNode *> unit_vars;
-      unit_vars.insert(u->loop_var.get());
-      if (const auto *inner_par = u->body.as<ForNode>()) {
-        if (inner_par->kind == ForKind::kParallel) {
-          unit_vars.insert(inner_par->loop_var.get());
-        }
-      }
-      int stores = 0;
-      int loads = 0;
-      for (const auto &a : ua.accesses) {
-        if (a.buf != carried) {
-          continue;
-        }
-        const auto *iv = a.indices.size() == 1 ? a.indices[0].as<VarNode>()
-                                               : nullptr;
-        if (iv == nullptr || unit_vars.count(iv) == 0) {
-          return false;
-        }
-        a.is_store ? ++stores : ++loads;
-      }
-      if (stores != 1 || loads < 1) {
-        return false;
-      }
-    }
-
-    // Seed: the statement right before the loop writes B once, never reads it.
-    size_t loop_pos = 0;
-    bool found_loop = false;
-    for (size_t i = 0; i < stmts.size(); ++i) {
-      if (stmts[i].get() == loop) {
-        loop_pos = i;
-        found_loop = true;
-        break;
-      }
-    }
-    if (!found_loop || loop_pos == 0) {
-      return false;
-    }
-    const auto *seed = stmts[loop_pos - 1].as<ForNode>();
-    if (seed == nullptr) {
-      return false;
-    }
-    ShellAccessCollector sa;
-    sa(static_cast<const Stmt &>(seed->body));
-    int seed_stores = 0;
-    int seed_loads = 0;
-    PrimExpr seed_value;
-    for (const auto &a : sa.accesses) {
-      if (a.buf != carried) {
-        continue;
-      }
-      if (a.indices.size() != 1 ||
-          a.indices[0].as<VarNode>() == nullptr) {
-        return false;
-      }
-      if (a.is_store) {
-        ++seed_stores;
-        if (const auto *st = seed->body.as<BufferStoreNode>()) {
-          seed_value = st->value;
-        }
-      } else {
-        ++seed_loads;
-      }
-    }
-    if (seed_stores != 1 || seed_loads != 0 || !seed_value.defined()) {
-      return false;
-    }
-    // The seed is broadcast at region level, so it must be lane-invariant.
-    bool seed_has_var = false;
-    PostOrderVisit(seed_value, [&](const ObjectRef &n) {
-      if (n.as<VarNode>() != nullptr) {
-        seed_has_var = true;
-      }
-    });
-    if (seed_has_var) {
-      return false;
-    }
-
-    // Isolation: no other unit in the region may touch the carried buffer.
-    for (const For &u : scan.units) {
-      if (StmtHasFor(loop->body, u.get()) || u.get() == seed) {
-        continue;
-      }
-      BufferAccessCounter counter(carried);
-      counter(static_cast<const Stmt &>(u.as<ForNode>()->body));
-      if (counter.count_ != 0) {
-        return false;
-      }
-    }
-
-    out->active = true;
-    out->loop = loop;
-    out->seed = seed;
-    out->src = GetRef<Buffer>(carried);
-    out->indices = indices;
-    out->seed_value = seed_value;
-    out->vreg = tirx::decl_buffer(
-        {IntImm(DataType::Int(32), 1)},
-        VectorDType(GetRef<Buffer>(carried)->dtype, lanes),
-        std::string(carried->name) + "_rcarry", "local.var");
-    return true;
-  }
-
-  void AnalyzeRegionCarry(const Stmt &region,
-                          const pto_analysis::PtoRegionScan &scan,
-                          int64_t lanes) {
-    region_carry_ = RegionCarry();
-    if (lanes <= 0) {
-      return;
-    }
-    std::vector<Stmt> stmts;
-    FlattenTopStmts(region, &stmts);
-    // Several serial loops may wrap parallel units (e.g. a fill loop
-    // followed by an accumulate loop): exactly one of them must match the
-    // carried-buffer pattern, otherwise the region is left unpromoted.
-    std::vector<const ForNode *> candidates;
-    for (const Stmt &s : stmts) {
-      const auto *f = s.as<ForNode>();
-      if (f == nullptr || f->kind != ForKind::kSerial) {
-        continue;
-      }
-      for (const For &u : scan.units) {
-        if (StmtHasFor(f->body, u.get())) {
-          candidates.push_back(f);
-          break;
-        }
-      }
-    }
-    for (const ForNode *cand : candidates) {
-      RegionCarry rc;
-      if (!TryRegionCarry(cand, stmts, scan, lanes, &rc)) {
-        continue;
-      }
-      if (region_carry_.active) {
-        region_carry_ = RegionCarry();  // ambiguous: promote nothing
-        return;
-      }
-      region_carry_ = rc;
-    }
-    if (region_carry_.active) {
-      VLOG(1) << "[rc] ACCEPT carry buffer " << region_carry_.src->name;
-    }
-  }
-
-  Stmt EmitRegionCarryWriteback(int64_t lanes) {
-    PrimExpr ptr = Call(
-        DataType::Handle(), tl::access_ptr(),
-        {BufferLoad(region_carry_.src, {make_zero(DataType::Int(32))}),
-         IntImm(DataType::Int(32), static_cast<int>(lanes)),
-         IntImm(DataType::Int(32), 2)});
-    return Evaluate(Call(
-        DataType::Void(), VmiOp("vstore"),
-        {BufferLoad(region_carry_.vreg, {make_zero(DataType::Int(32))}), ptr,
-         IntImm(DataType::Int(32), 0), shared_mask_}));
-  }
-
-  // ------------------------------------------------------------------
   // Per-unit conversion
   // ------------------------------------------------------------------
   // Ranges of the serial loops enclosing a unit inside the region, for
@@ -1922,58 +1321,6 @@ private:
                                    {make_zero(DataType::Int(32))}));
         return;
       }
-      if (carry_seed_ != nullptr && store == carry_seed_ &&
-          store->buffer.scope() != "local.fragment") {
-        // Seed of the promoted carry: forward the value into the vreg
-        // buffer instead of storing to UB, so the shell's loads never
-        // see a round-trip.
-        Array<Stmt> pre;
-        PrimExpr value = ConvertExpr(store->value, &pre);
-        if (value.dtype().lanes() == 1) {
-          value = BroadcastToLanes("vbrc_val", value, &pre);
-        }
-        for (const auto &s : pre) {
-          out->push_back(s);
-        }
-        out->push_back(BufferStore(carry_vreg_, value,
-                                   {make_zero(DataType::Int(32))}));
-        return;
-      }
-      if (carry_active_ && store->buffer.scope() != "local.fragment" &&
-          IsCarryAccess(store->buffer, store->indices)) {
-        // Carry update inside the shell: write the vreg buffer instead
-        // of a vstore. Unwrap a trailing pure Bind so the emitted
-        // assignment keeps the direct `acc = f(acc, ...)` form the
-        // PTODSL rewriter turns into scf.for iter_args.
-        Array<Stmt> pre;
-        PrimExpr value = ConvertExpr(store->value, &pre);
-        if (const auto *var = value.as<VarNode>()) {
-          if (!pre.empty()) {
-            const Stmt &last = pre.back();
-            if (const auto *b = last.as<BindNode>()) {
-              if (b->var.get() == var) {
-                Array<Stmt> kept;
-                for (size_t i = 0; i + 1 < pre.size(); ++i) {
-                  kept.push_back(pre[i]);
-                }
-                pre = kept;
-                value = b->value;
-              }
-            }
-          }
-        }
-        if (value.dtype().lanes() == 1) {
-          // Region-level promotion: the seed unit stores a scalar constant
-          // into the vector carrier, so broadcast it first.
-          value = BroadcastToLanes("vbrc_val", value, &pre);
-        }
-        for (const auto &s : pre) {
-          out->push_back(s);
-        }
-        out->push_back(BufferStore(carry_vreg_, value,
-                                   {make_zero(DataType::Int(32))}));
-        return;
-      }
       Array<Stmt> pre;
       PrimExpr value = ConvertExpr(store->value, &pre);
       // One-sided conditional writes never arrive here as predicates:
@@ -2079,11 +1426,7 @@ private:
       Array<Stmt> inner;
       Map<Var, PrimExpr> saved_env = bind_env_;
       Map<Var, Var> saved_map = value_map_;
-      bool saved_carry = carry_active_;
       Map<Var, Range> saved_ranges = outer_loop_ranges_;
-      if (carry_loop_ != nullptr && loop == carry_loop_) {
-        carry_active_ = true;
-      }
       // Verify admitted the shell with constant bounds; bind them so the
       // fragment entry-interval proof sees the same ranges it did.
       if (loop->min.as<IntImmNode>() != nullptr &&
@@ -2095,7 +1438,6 @@ private:
       // automatic vecscope barriers (same policy as the unit level).
       ConvertBody(loop->body, &inner);
       outer_loop_ranges_ = std::move(saved_ranges);
-      carry_active_ = saved_carry;
       bind_env_ = std::move(saved_env);
       value_map_ = std::move(saved_map);
       out->push_back(For(loop->loop_var, loop->min, loop->extent,
@@ -2209,11 +1551,6 @@ private:
       }
       if (load->buffer.scope() == "local.fragment") {
         return ConvertFragmentLoad(load, pre);
-      }
-      if (carry_active_ && load->buffer.scope() != "local.fragment" &&
-          IsCarryAccess(load->buffer, load->indices)) {
-        // Promoted carry read: the value lives in the vreg buffer.
-        return BufferLoad(carry_vreg_, {make_zero(DataType::Int(32))});
       }
       auto access = pto_analysis::AnalyzeBufferAccess(
           load->buffer, load->indices, /*is_write=*/false, loop_var_,
@@ -2690,20 +2027,6 @@ private:
   /*! Per-unit scalar buffer holding `remaining` for a non-divisible
    * extent (invalid for divisible units). */
   tirx::Buffer remaining_buffer_{};
-  // Loop-shell carry promotion (AnalyzeLoopShell): when a unit's
-  // preserved serial shell matches the canonical carry pattern, the
-  // carried buffer's in-shell accesses are rewritten to this local.var
-  // vreg buffer, so the loop never round-trips through UB — the
-  // in-shell cross-iteration RAW is exactly the shape PR307's
-  // auto-bar coverage does not model for deep nests (PTOAS
-  // hw-native-sys/PTOAS#1679), so keeping it in registers is the
-  // safe shape.
-  const BufferStoreNode *carry_seed_ = nullptr;
-  const ForNode *carry_loop_ = nullptr;
-  tirx::Buffer carry_src_{};
-  tirx::Buffer carry_vreg_{};
-  Array<PrimExpr> carry_indices_{};
-  bool carry_active_ = false;
   // Ranges of serial loops in scope at the fragment access being converted
   // (region-level wrappers from EnclosingSerialRanges plus in-unit shells
   // bound by ConvertBody). Passed to AnalyzeFragmentAccess so the entry
@@ -2712,15 +2035,7 @@ private:
   // Serial loops in scope at the current mutation position outside any
   // region (kernel level), maintained by the mutator's For visitor.
   Map<Var, Range> outer_serial_ranges_;
-  // Region-level carry promotion state (AnalyzeRegionCarry). When a unit is
-  // the seed or an in-loop unit of the promoted region, its B accesses are
-  // redirected to this vreg and the allocation happens once at region level
-  // (unit_carry_from_region_ suppresses WrapCarryAlloc).
-  RegionCarry region_carry_{};
-  bool unit_carry_from_region_ = false;
-  // Region-level carry matches any single lane Var index (each unit has its
   // own Parallel loop var), not one fixed expression.
-  bool carry_lane_var_match_ = false;
   // Per-lane scalar promotion (`T.alloc_var` inside a Parallel unit). The
   // single-element `local.var` buffer is a private register per lane, so each
   // whole-buffer access becomes a `local.var` vector (vreg) access: the seed

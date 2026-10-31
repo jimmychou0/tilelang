@@ -540,6 +540,13 @@ private:
         if (op->name_hint == kSimdVfBlockName) {
           PtoRegionScan scan = ScanPtoRegion(op->body);
           if (scan.has_any_parallel) {
+            // Unsupported wrapper shapes (3+ layer Parallel nests,
+            // non-adjacent nesting, Parallel under if) already carry an
+            // accurate diagnostic from ScanPtoRegion — do not let the
+            // solver report a misleading layout conflict for them.
+            if (scan.has_unsupported_wrapper) {
+              return;
+            }
             outer_->AddRegion(op, scan);
           }
           return;  // Nested regions are handled at their own visit.

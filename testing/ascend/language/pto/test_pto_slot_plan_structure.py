@@ -1005,7 +1005,12 @@ def test_fragment_shell_accumulator_converts_via_slot():
             T.copy(b_ub, B)
 
     mod, _ = _lower_capture(main, "VectorizeParallelToPTO")
-    assert "acc_carry" not in str(_body_of(mod)), "a fragment must never become a carry vreg"
+    # The fragment's read-modify-write went through the slot path (vload +
+    # vstore on the handle), not through any carry vreg or UB round-trip
+    # (the carry subsystem is retired with the base; this pins the slot path).
+    handle = "acc_fragment_mem"
+    assert _slot_vmi_calls(mod, "vload", handle), "acc must read via slot vload"
+    assert _slot_vmi_calls(mod, "vstore", handle), "acc must write via slot vstore"
     handle = "acc_fragment_mem"
     # init: 1 store; in-shell RMW: 1 load + 1 store; read-out: 1 load.
     assert len(_slot_vmi_calls(mod, "vstore", handle)) == 2
