@@ -1427,8 +1427,12 @@ private:
       Map<Var, PrimExpr> saved_env = bind_env_;
       Map<Var, Var> saved_map = value_map_;
       Map<Var, Range> saved_ranges = outer_loop_ranges_;
-      // Verify admitted the shell with constant bounds; bind them so the
-      // fragment entry-interval proof sees the same ranges it did.
+      // Bind the shell's loop-variable range when it is a compile-time
+      // constant so the fragment entry-interval proof sees the same range
+      // Verify bound. (Verify also admits runtime trip counts — those
+      // shells carry no fragment entries depending on them, so the proof
+      // does not need the range; a fragment entry referencing a runtime
+      // trip count was already rejected upstream for other reasons.)
       if (loop->min.as<IntImmNode>() != nullptr &&
           loop->extent.as<IntImmNode>() != nullptr) {
         outer_loop_ranges_.Set(

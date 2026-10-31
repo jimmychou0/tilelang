@@ -218,18 +218,31 @@ private:
   Stmt VisitStmt_(const SBlockNode *op) final {
     block_stack_.push_back(op);
     Stmt result = StmtExprMutator::VisitStmt_(op);
-    block_stack_.pop_back();
-
+    // The block stays on the chain during PlanRegion — the converting
+    // SIMD_VF block itself carries the layout_map entries the layout
+    // solver wrote back, and the plan needs to read them here.
     if (op->name_hint != "SIMD_VF") {
+      block_stack_.pop_back();
       return result;
     }
     const Stmt &region = op->body;
     pto::PtoRegionScan scan = pto::ScanPtoRegion(region);
     if (!scan.has_any_parallel) {
       // Pure hand-written VMI region: no conversion, no slots.
+      block_stack_.pop_back();
       return result;
     }
-    return PlanRegion(op, Downcast<SBlock>(result));
+    if (scan.has_unsupported_wrapper) {
+      // Unsupported loop shapes (3+ layer Parallel nests, non-adjacent
+      // nesting, Parallel under if) carry accurate diagnostics from
+      // ScanPtoRegion — Verify delivers them. Planning here would produce
+      // a misleading "no layout_map entry" error first.
+      block_stack_.pop_back();
+      return result;
+    }
+    Stmt planned = PlanRegion(op, Downcast<SBlock>(result));
+    block_stack_.pop_back();
+    return planned;
   }
 
   Stmt PlanRegion(const SBlockNode *op, SBlock block) {

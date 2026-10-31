@@ -354,8 +354,12 @@ private:
     if (!dst_frag && !src_frag) {
       return Stmt();  // plain UB copy: not this pass's concern
     }
+    const int64_t *sext_p = node->src_range.size() == 1u
+                                 ? as_const_int(node->src_range[0]->extent)
+                                 : nullptr;
     if (dst_frag && src_frag && lanes_ > 0 &&
-        *dmin_p % lanes_ == *smin_p % lanes_) {
+        *dmin_p % lanes_ == *smin_p % lanes_ &&
+        (sext_p == nullptr || *sext_p == *dext_p)) {
       return BuildPredicatedCopy(node->src, *smin_p, node->dst, *dmin_p,
                                  *dext_p, lanes_);
     }

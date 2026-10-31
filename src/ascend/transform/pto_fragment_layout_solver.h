@@ -25,7 +25,7 @@
  *  4. Pick per component: the smaller total backing size wins; ties are
  *     broken by the source-order-first unit with a free direction
  *     taking the inner (loop) dimension. Unconstrained fragments take
- *     the byte-minimal lane dim (ties: the last dim, matching the inner
+ *     the byte-minimal lane dim (ties: the first dim (byte-minimal then source-order), matching the inner
  *     preference).
  *  5. Emit one canonical Fragment layout per fragment buffer of every
  *     converting region — including fragments that are never accessed

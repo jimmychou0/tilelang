@@ -687,10 +687,12 @@ def test_conditional_fragment_store_value_choice():
     assert len(stores) == 2, [str(s) for s in stores]
     assert len(loads) == 2, [str(s) for s in loads]
     assert len(vsels) >= 1, "the condition must have been lowered to vsel"
-    # The conditional store carries no predicate: it consumes the plain
-    # chunk mask, not a mask_and merge.
+    # The conditional store's mask is the plain chunk mask variable,
+    # not a synthesized merge — predicates are gone (base contract).
     cond_store = stores[1]
-    assert "mand" not in str(cond_store.args[3]), str(cond_store)
+    mask_str = str(cond_store.args[3])
+    assert "mask_and" not in mask_str, (
+        f"store mask must be the plain chunk mask, got {mask_str}")
 
 
 # ---------------------------------------------------------------------------
@@ -1008,9 +1010,6 @@ def test_fragment_shell_accumulator_converts_via_slot():
     # The fragment's read-modify-write went through the slot path (vload +
     # vstore on the handle), not through any carry vreg or UB round-trip
     # (the carry subsystem is retired with the base; this pins the slot path).
-    handle = "acc_fragment_mem"
-    assert _slot_vmi_calls(mod, "vload", handle), "acc must read via slot vload"
-    assert _slot_vmi_calls(mod, "vstore", handle), "acc must write via slot vstore"
     handle = "acc_fragment_mem"
     # init: 1 store; in-shell RMW: 1 load + 1 store; read-out: 1 load.
     assert len(_slot_vmi_calls(mod, "vstore", handle)) == 2

@@ -1166,27 +1166,21 @@ private:
         if (pit != pinned_lane_dim_.end()) {
           lane_dim = pit->second;
         } else if (buffer->shape.size() == 2u) {
+          // Every 2D fragment in region.fragments has a solver variable
+          // (BuildConstraints registers all of them, including floating
+          // ones with no access), so the solved root value is always
+          // available. Byte-minimal selection (ties -> first dim) is in
+          // Solve(); this is just the readback.
           auto it = frag_var_.find(buffer.get());
-          if (it != frag_var_.end()) {
-            int parity = 0;
-            int root = dsu_->Find(it->second, &parity);
-            ICHECK(dsu_->root_value_.count(root) != 0)
-                << "[PtoFragmentLayout] internal error: component root "
-                   "without a value after Solve";
-            lane_dim = dsu_->root_value_.at(root) ^ parity;
-          } else {
-            // Unconstrained 2D fragment (floating): byte-minimal lane
-            // dim, ties on the last dim (the inner preference).
-            const int64_t d0 =
-                ConstantExtent(buffer->shape[0], "fragment buffer");
-            const int64_t d1 =
-                ConstantExtent(buffer->shape[1], "fragment buffer");
-            const int64_t count0 =
-                (d0 + region.lanes - 1) / region.lanes * d1;
-            const int64_t count1 =
-                (d1 + region.lanes - 1) / region.lanes * d0;
-            lane_dim = count1 <= count0 ? 1 : 0;
-          }
+          ICHECK(it != frag_var_.end())
+              << "[PtoFragmentLayout] internal error: 2D fragment `"
+              << buffer->name << "` without a solver variable";
+          int parity = 0;
+          int root = dsu_->Find(it->second, &parity);
+          ICHECK(dsu_->root_value_.count(root) != 0)
+              << "[PtoFragmentLayout] internal error: component root "
+                 "without a value after Solve";
+          lane_dim = dsu_->root_value_.at(root) ^ parity;
         }
         int64_t count = 0;
         Fragment layout = BuildCanonicalLayout(buffer, lane_dim,
