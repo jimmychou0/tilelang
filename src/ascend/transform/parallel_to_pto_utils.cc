@@ -90,6 +90,67 @@ const char *VectorUnaryVmiOpName(const std::string &tirx_op_name) {
   return nullptr;
 }
 
+Map<Var, Range> CollectEnclosingSerialRanges(const Stmt &stmt,
+                                             const ForNode *unit) {
+  Map<Var, Range> ranges;
+  std::function<bool(const Stmt &)> visit = [&](const Stmt &s) -> bool {
+    if (s.get() == unit) {
+      return true;
+    }
+    if (const auto *f = s.as<ForNode>()) {
+      Map<Var, Range> saved = ranges;
+      if (f->kind != ForKind::kParallel &&
+          f->min.as<IntImmNode>() != nullptr &&
+          f->extent.as<IntImmNode>() != nullptr) {
+        ranges.Set(f->loop_var, Range::FromMinExtent(f->min, f->extent));
+      }
+      if (visit(f->body)) {
+        return true;
+      }
+      ranges = std::move(saved);
+      return false;
+    }
+    if (const auto *seq = s.as<SeqStmtNode>()) {
+      for (const Stmt &child : seq->seq) {
+        if (visit(child)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    // Descend through the body-carrying statements: the solver walks
+    // from the function root, and a unit can sit under an if between a
+    // kernel-level serial loop and the region — Verify's visitor crosses
+    // those statements when it binds ranges, so this walk must too or
+    // the solver would prove against a narrower domain and reject
+    // programs Verify accepts. (tirx's AssertStmt carries no body.)
+    if (const auto *ite = s.as<IfThenElseNode>()) {
+      if (visit(ite->then_case)) {
+        return true;
+      }
+      if (ite->else_case.defined()) {
+        return visit(ite->else_case.value());
+      }
+      return false;
+    }
+    if (const auto *wh = s.as<WhileNode>()) {
+      return visit(wh->body);
+    }
+    if (const auto *attr = s.as<AttrStmtNode>()) {
+      return visit(attr->body);
+    }
+    if (const auto *block = s.as<SBlockNode>()) {
+      return visit(block->body);
+    }
+    if (const auto *realize = s.as<SBlockRealizeNode>()) {
+      return visit(realize->block->body);
+    }
+    return false;
+  };
+  visit(stmt);
+  return ranges;
+}
+
 PtoInverseMapping InvertPtoLaneLayout(const For &loop) {
   auto anno = loop->annotations.Get(attr::kPtoParallelLoopLayout);
   if (!anno.has_value()) {
@@ -575,6 +636,179 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
   throw PtoAnalysisError(oss.str());
 }
 
+FragmentAccess AnalyzeFragmentAccess(const Buffer &buffer,
+                                     const Array<PrimExpr> &indices,
+                                     bool is_write, const Var &loop_var,
+                                     const PtoInverseMapping &mapping,
+                                     const Fragment &layout,
+                                     arith::Analyzer *analyzer,
+                                     const Map<Var, PrimExpr> &bind_env,
+                                     const Map<Var, Range> &outer_loop_ranges) {
+  FragmentAccess access;
+  access.buffer = buffer;
+  access.layout = layout;
+  access.is_write = is_write;
+
+  ICHECK(layout.defined())
+      << "AnalyzeFragmentAccess requires a layout for buffer " << buffer->name;
+  ICHECK_EQ(layout->GetForwardIndex().size(), 1u)
+      << "fragment layout for buffer `" << buffer->name
+      << "` must have exactly one entry dimension, got "
+      << layout->GetForwardIndex().size();
+  if (indices.size() != layout->InputDim()) {
+    std::ostringstream oss;
+    oss << "fragment buffer `" << buffer->name << "` access has "
+        << indices.size() << " indices but its layout is " << layout->InputDim()
+        << "D";
+    throw PtoAnalysisError(oss.str());
+  }
+
+  // Resolve bind aliases and reject opaque address terms, exactly like the
+  // UB access analysis (the same reasons apply: alias chains hide lane
+  // dependence, loaded values would make the entry data-dependent).
+  Array<PrimExpr> resolved;
+  for (const auto &idx : indices) {
+    auto opt = ResolveIndexAliases(idx, bind_env);
+    if (!opt.has_value()) {
+      std::ostringstream oss;
+      oss << "fragment buffer `" << buffer->name
+          << "`: bind alias chain in index is too deep, cyclic, or "
+             "depends on a loaded value (data-dependent slot entries are "
+             "not yet supported)";
+      throw PtoAnalysisError(oss.str());
+    }
+    resolved.push_back(opt.value());
+  }
+  for (const auto &idx : resolved) {
+    if (!IsSupportedAddressExpr(idx)) {
+      std::ostringstream oss;
+      oss << "fragment buffer `" << buffer->name
+          << "`: address expression contains a loaded value or an "
+             "unsupported call (loaded values and opaque/extern calls "
+             "cannot appear in slot addresses)";
+      throw PtoAnalysisError(oss.str());
+    }
+  }
+
+  // Substitute the inverse lane mapping into the access indices, then
+  // evaluate the layout's forward maps over the substituted logical
+  // coordinates.
+  Array<PrimExpr> indices_after_inverse;
+  for (const auto &idx : resolved) {
+    indices_after_inverse.push_back(analyzer->Simplify(
+        SubstituteVar(idx, loop_var.get(), mapping.index_expr)));
+  }
+
+  // The layout's forward expressions are over InputPlaceholder(i); a
+  // storage-lane / entry pair for this concrete access is their
+  // substitution with the (inverse-mapped) access indices.
+  Map<Var, PrimExpr> coord_map;
+  for (size_t i = 0; i < indices_after_inverse.size(); ++i) {
+    coord_map.Set(InputPlaceholder(i), indices_after_inverse[i]);
+  }
+  PrimExpr storage_lane =
+      analyzer->Simplify(Substitute(layout->GetForwardThread(), coord_map));
+  PrimExpr entry_expr =
+      analyzer->Simplify(Substitute(layout->GetForwardIndex()[0], coord_map));
+
+  // Proof domain identical to AnalyzeBufferAccess: full lane range,
+  // per-row chunk range, kept-coordinate range.
+  arith::Analyzer proof;
+  proof.Bind(
+      mapping.lane_var,
+      Range::FromMinExtent(make_zero(mapping.lane_var->dtype),
+                           IntImm(mapping.lane_var->dtype, mapping.lanes)));
+  proof.Bind(mapping.chunk_var,
+             Range::FromMinExtent(
+                 make_zero(mapping.chunk_var->dtype),
+                 IntImm(mapping.chunk_var->dtype, mapping.chunk_count)));
+  if (mapping.is_2d && mapping.serial_var() != nullptr) {
+    const VarNode *serial = mapping.serial_var();
+    const int64_t kept_extent =
+        mapping.select_inner ? mapping.outer_extent : mapping.inner_extent;
+    proof.Bind(GetRef<Var>(serial),
+               Range::FromMinExtent(make_zero(serial->dtype),
+                                    IntImm(serial->dtype, kept_extent)));
+  }
+  // Bind outer serial loop variable ranges (from the caller's scope
+  // analysis) so the dual-sided entry interval is provable for entries
+  // that depend on outer loops: f[k, j] with k in [0, K).
+  for (const auto &[var, range] : outer_loop_ranges) {
+    if (range.defined()) {
+      proof.Bind(var, range);
+    }
+  }
+
+  // (a) storage lane == execution lane. A shifted access (B[i, j+1]) or a
+  // cross-lane permutation (B[VL-1-lane]) fails here.
+  if (!proof.CanProveEqual(storage_lane, mapping.lane_var)) {
+    std::ostringstream oss;
+    oss << "fragment buffer `" << buffer->name
+        << "`: the accessed element's storage lane (" << storage_lane
+        << ") does not equal the execution lane; accesses that shift or "
+           "permute lanes across the slot layout have no lowering";
+    throw PtoAnalysisError(oss.str());
+  }
+
+  // (b) the entry is uniform across this round's lanes (dynamic chunk /
+  // kept-coordinate terms are fine — they address different entries per
+  // round, never per lane).
+  {
+    PrimExpr at_zero = proof.Simplify(SubstituteVar(
+        entry_expr, mapping.lane_var.get(), make_zero(entry_expr.dtype())));
+    if (!proof.CanProveEqual(entry_expr, at_zero)) {
+      std::ostringstream oss;
+      oss << "fragment buffer `" << buffer->name << "`: the slot entry index ("
+          << entry_expr
+          << ") depends on the lane coordinate; a whole-entry slot "
+             "read/write cannot express lanes spread across entries";
+      throw PtoAnalysisError(oss.str());
+    }
+  }
+
+  // (c) dual-sided entry interval: min(entry) >= 0 and max(entry) < count.
+  // count comes from the layout's output shape (the entry count). The
+  // proof analyzer already binds lane/chunk/kept-coordinate ranges; any
+  // outer serial loop variable must be bound by the caller for the
+  // interval to be provable (the analyzer's Bind calls below use ranges
+  // from the mapping — outer variables not in the mapping are free and
+  // make the proof fail with a diagnostic, not a silent pass).
+  {
+    const Array<PrimExpr> output_shape = layout->OutputShape();
+    const int64_t *count_ptr = as_const_int(output_shape[0]);
+    ICHECK(count_ptr != nullptr && *count_ptr > 0)
+        << "fragment layout for buffer `" << buffer->name
+        << "` must have a constant positive entry count, got "
+        << output_shape[0];
+    const int64_t entry_count = *count_ptr;
+
+    // Try proving with the analyzer: entry >= 0 and entry < count.
+    PrimExpr lower_bound =
+        proof.Simplify(GE(entry_expr, make_zero(entry_expr.dtype())));
+    PrimExpr upper_bound = proof.Simplify(
+        LT(entry_expr, IntImm(entry_expr.dtype(), entry_count)));
+    bool lower_ok = is_one(lower_bound);
+    bool upper_ok = is_one(upper_bound);
+    if (!lower_ok) {
+      std::ostringstream oss;
+      oss << "fragment buffer `" << buffer->name << "`: the slot entry index ("
+          << entry_expr << ") can be negative; entry offsets must stay in "
+          << "[0, " << entry_count << ")";
+      throw PtoAnalysisError(oss.str());
+    }
+    if (!upper_ok) {
+      std::ostringstream oss;
+      oss << "fragment buffer `" << buffer->name << "`: the slot entry index ("
+          << entry_expr << ") can reach or exceed the entry count; entry "
+          << "offsets must stay in [0, " << entry_count << ")";
+      throw PtoAnalysisError(oss.str());
+    }
+  }
+
+  access.entry_expr = entry_expr;
+  return access;
+}
+
 bool IsSupportedElementDType(DataType dtype) {
   // No packed sub-byte element types (FP4 etc.), no
   // buffer-element dtypes that already carry vector lanes, and no FP64
@@ -1036,6 +1270,30 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     return LaneUse::kUnknown;
   }
   if (const auto *load = expr.as<BufferLoadNode>()) {
+    // Fragment loads in value positions classify through the fragment
+    // access proof when a solved layout is in scope (R4 §3.6): the UB
+    // address proof cannot see the slot backing's layout and would
+    // misclassify legal whole-entry reads. Storage lane == execution
+    // lane -> Varying; anything else reports the fragment reason.
+    if (load->buffer.scope() == "local.fragment" &&
+        ctx->fragment_layout_lookup != nullptr) {
+      Optional<Fragment> layout_opt = ctx->fragment_layout_lookup(load->buffer);
+      if (layout_opt.has_value()) {
+        try {
+          AnalyzeFragmentAccess(load->buffer, load->indices,
+                                /*is_write=*/false, ctx->loop_var,
+                                ctx->mapping, layout_opt.value(),
+                                ctx->analyzer, ctx->bind_env,
+                                ctx->outer_loop_ranges);
+          return LaneUse::kVarying;
+        } catch (const PtoAnalysisError &err) {
+          if (reason != nullptr) {
+            *reason = err.what();
+          }
+          return LaneUse::kUnknown;
+        }
+      }
+    }
     try {
       auto access = AnalyzeBufferAccess(
           load->buffer, load->indices, /*is_write=*/false, ctx->loop_var,

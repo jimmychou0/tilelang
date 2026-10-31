@@ -123,7 +123,8 @@ std::pair<int64_t, int64_t> CheckedPaddingForInference(int64_t extent,
 
 int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
                          int64_t M, int64_t N, int64_t lanes,
-                         std::string *why) {
+                         std::string *why,
+                         const ffi::Map<tirx::Buffer, Layout> *fragment_layouts) {
   PtoAccessCollector collector;
   collector(root->body);
 
@@ -198,17 +199,6 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
       for (const auto &idx : resolved) {
         indices_after.push_back(SubstituteVar(idx, sel_var.get(), sel_expr));
       }
-      Array<PrimExpr> raw = access.buffer->ElemOffset(indices_after);
-      if (raw.size() != 1) {
-        *why = "multi-axis element offsets are not supported";
-        return false;
-      }
-      PrimExpr off = raw[0];
-      Array<PrimExpr> start_indices;
-      for (const auto &idx : indices_after) {
-        start_indices.push_back(SubstituteVar(idx, lane.get(), make_zero(dt)));
-      }
-      PrimExpr start = access.buffer->ElemOffset(start_indices)[0];
       arith::Analyzer probe;
       probe.Bind(lane, Range::FromMinExtent(make_zero(dt), IntImm(dt, lanes)));
       // In-row chunk range only: q is the per-row chunk index in [0, Q),
@@ -222,6 +212,50 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
       // final consumers' proof binds the same fact.
       probe.Bind(kept_var,
                  Range::FromMinExtent(make_zero(dt), IntImm(dt, kept_extent)));
+      // A solved fragment layout redefines the buffer's backing: prove the
+      // access against the layout's own forward maps (storage lane equals
+      // the execution lane under this candidate) instead of the logical
+      // row-major offset — a fragment's logical strides say nothing about
+      // its backing (the layout solver owns them). The entry interval was
+      // already proven when the layout was solved.
+      if (fragment_layouts != nullptr &&
+          access.buffer.scope() == "local.fragment") {
+        auto fit = fragment_layouts->find(access.buffer);
+        if (fit != fragment_layouts->end()) {
+          const auto *frag = (*fit).second.as<FragmentNode>();
+          if (frag != nullptr) {
+            Map<Var, PrimExpr> coord;
+            for (size_t d = 0; d < indices_after.size(); ++d) {
+              coord.Set(InputPlaceholder(d), indices_after[d]);
+            }
+            PrimExpr storage_lane = probe.Simplify(
+                Substitute(frag->GetForwardThread(), coord));
+            if (!probe.CanProveEqual(storage_lane, lane)) {
+              std::ostringstream oss;
+              oss << "fragment buffer `" << access.buffer->name
+                  << "` (" << (access.is_write ? "store" : "load")
+                  << ") does not map its storage lane onto the execution "
+                     "lane under the "
+                  << (select_inner ? "inner (j)" : "outer (i)")
+                  << " mapping";
+              *why = oss.str();
+              return false;
+            }
+            continue;
+          }
+        }
+      }
+      Array<PrimExpr> raw = access.buffer->ElemOffset(indices_after);
+      if (raw.size() != 1) {
+        *why = "multi-axis element offsets are not supported";
+        return false;
+      }
+      PrimExpr off = raw[0];
+      Array<PrimExpr> start_indices;
+      for (const auto &idx : indices_after) {
+        start_indices.push_back(SubstituteVar(idx, lane.get(), make_zero(dt)));
+      }
+      PrimExpr start = access.buffer->ElemOffset(start_indices)[0];
       const bool continuous = probe.CanProveEqual(off, start + lane);
       const bool uniform = probe.CanProveEqual(
           off, probe.Simplify(SubstituteVar(off, lane.get(), make_zero(dt))));
@@ -290,7 +324,8 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
 // contract (access patterns, dtype, expression whitelist) belongs to
 // VerifyParallelToPTO; the checks below are only the minimal conditions
 // needed to construct a valid layout, reported as layout-inference errors.
-Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds) {
+Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds,
+                                const ffi::Map<tirx::Buffer, Layout> *fragment_layouts) {
   PtoParallelLoopCollector loop_collector;
   loop_collector(root);
   const Array<IterVar> &loop_vars = loop_collector.loop_vars;
@@ -361,7 +396,8 @@ Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds) {
     const Var &j_var = loop_vars[1]->var;
     std::string candidate_why;
     int required =
-        PtoRequiredVectorDim(root, i_var, j_var, M, N, lanes, &candidate_why);
+        PtoRequiredVectorDim(root, i_var, j_var, M, N, lanes,
+                             &candidate_why, fragment_layouts);
     if (required < 0) {
       // Both candidates failed (an access that is neither continuous nor a
       // lane-uniform load under the padded domain). Report the concrete

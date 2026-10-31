@@ -26,9 +26,11 @@
 #include "buffer_addresses.h"
 #include "buffer_alias.h"
 #include "merge_ub_common.h"
+#include "pto_slot_plan.h"
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/function.h>
+#include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
@@ -567,6 +569,88 @@ private:
   bool found_contract_{false};
 };
 
+// Final-capacity safety net for kernels with PTO slot storage. The
+// scheduled path already reserves the slot capacity inside AutoSchedule;
+// with scheduling disabled (or as pure defense), no other pass asserts the
+// merged UB total. Gated on the presence of slot backings — identified
+// through their declarations (this pass runs after Vectorize consumed the
+// plans), with the plan annotation kept as a pre-conversion fallback — so
+// every existing kernel keeps its exact behavior.
+void CheckPtoSlotUnifiedBufferCapacity(const Stmt &body) {
+  if (CollectAllSlotBackingVars(body).empty()) {
+    return;
+  }
+  // Mirrors GetSharedMemoryLimit in auto_schedule.cc: 248 KB physical UB
+  // minus the 32 KB SIMT_VF thread-context reservation when a SIMT_VF block
+  // is present.
+  constexpr int64_t kPhysicalUnifiedBufferSize = 248 * 1024;
+  constexpr int64_t kSimtVFThreadContextSize = 32 * 1024;
+  class SimtVFDetector : public tirx::StmtVisitor {
+  public:
+    bool found = false;
+    void VisitStmt_(const tirx::SBlockNode *op) final {
+      if (op->name_hint == "SIMT_VF") {
+        found = true;
+      }
+      tirx::StmtVisitor::VisitStmt_(op);
+    }
+  };
+  SimtVFDetector detector;
+  detector(body);
+  const int64_t limit =
+      detector.found ? kPhysicalUnifiedBufferSize - kSimtVFThreadContextSize
+                     : kPhysicalUnifiedBufferSize;
+
+  class DynShmemSizeCollector : public tirx::StmtVisitor {
+  public:
+    int64_t total = 0;
+    bool all_constant = true;
+    void VisitStmt_(const tirx::AllocBufferNode *op) final {
+      if (op->buffer.scope() == "shared.dyn") {
+        int64_t elements = 1;
+        for (const auto &dim : op->buffer->shape) {
+          const int64_t *v = as_const_int(dim);
+          if (v == nullptr) {
+            all_constant = false;
+            break;
+          }
+          elements *= *v;
+        }
+        if (all_constant) {
+          // Element bytes follow the element type including any packing
+          // lanes (a vector dtype occupies lanes × scalar bytes).
+          total += elements * ((op->buffer->dtype.bits() + 7) / 8) *
+                   op->buffer->dtype.lanes();
+        }
+      }
+      tirx::StmtVisitor::VisitStmt_(op);
+    }
+  };
+  DynShmemSizeCollector collector;
+  collector(body);
+  if (!collector.all_constant) {
+    std::ostringstream oss;
+    oss << "[MergeUBAllocations] this kernel reserves PTO slot storage "
+           "but also has a shared.dyn allocation with a symbolic shape; "
+           "the final unified-buffer capacity cannot be checked. Use "
+           "compile-time constant buffer shapes for kernels with "
+           "T.alloc_fragment";
+    LOG(FATAL) << oss.str();
+  }
+  // A capacity overrun is a user-facing program limit, not an internal
+  // invariant: report it as a classified compilation error with the same
+  // actionable advice as the AutoSchedule budget message (U1/U5).
+  if (collector.total > limit) {
+    std::ostringstream oss;
+    oss << "[MergeUBAllocations] the merged unified-buffer allocation of "
+        << collector.total << " bytes exceeds the target capacity of "
+        << limit << " bytes (PTO slot backing included); reduce the "
+           "reserved fragment buffers kept across loops or shrink the "
+           "tile";
+    LOG(FATAL) << oss.str();
+  }
+}
+
 Stmt MergeUBAllocations(Stmt stmt, int align_bytes, bool verbose,
                         bool disable_reuse) {
   BufferAliasContractExtractor extractor;
@@ -575,6 +659,11 @@ Stmt MergeUBAllocations(Stmt stmt, int align_bytes, bool verbose,
     ICHECK(!extractor.Addresses().has_value())
         << kBufferAddresses << " requires the Ascend scheduled allocation "
         << "pipeline and its buffer-alias contract";
+    // The no-contract path returns before any merging, but a slot
+    // kernel without a buffer-alias contract still owes its final
+    // capacity check (D4's exclusivity floor) — run it on the
+    // un-merged body so early exit does not skip it.
+    CheckPtoSlotUnifiedBufferCapacity(stmt);
     return stmt;
   }
   BufferAliasMap aliases = extractor.Aliases();
@@ -649,8 +738,13 @@ Stmt MergeUBAllocations(Stmt stmt, int align_bytes, bool verbose,
     result.total_size = prefix + private_size;
     return result;
   };
-  return merge_ub::MergeAllocations(std::move(stmt), align_bytes, verbose,
-                                    false, planner, placed_scopes);
+  // Lifetime reuse stays enabled: the AIV planner below groups private
+  // allocations per storage id, and PlanNoReuse would bypass that grouping.
+  Stmt merged = merge_ub::MergeAllocations(std::move(stmt), align_bytes,
+                                           verbose, false, planner,
+                                           placed_scopes);
+  CheckPtoSlotUnifiedBufferCapacity(merged);
+  return merged;
 }
 
 } // namespace

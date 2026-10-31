@@ -42,8 +42,14 @@ namespace pto {
  * modified; only the Fragment input extent of the vectorized dimension is
  * padded when the logical extent is not a multiple of L.
  */
-Fragment InferPtoParallelLayout(const tirx::For &root,
-                                const Range &lane_bounds);
+Fragment InferPtoParallelLayout(
+    const tirx::For &root, const Range &lane_bounds,
+    /*! Solved fragment layouts (layout-solver output injected into the
+     * annotated map). When a collected access's buffer has an entry here,
+     * its candidate proof uses the layout's forward maps (storage lane
+     * equals the execution lane) instead of the logical row-major offset.
+     * Null when no fragment layouts are in scope. */
+    const ffi::Map<tirx::Buffer, Layout> *fragment_layouts = nullptr);
 
 } // namespace pto
 } // namespace tl

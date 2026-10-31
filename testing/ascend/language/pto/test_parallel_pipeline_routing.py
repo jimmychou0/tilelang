@@ -9,10 +9,12 @@ Scope: this file proves routing only.
   the three PTO Parallel passes;
 * PTO ``SimtVF`` and hand-written PTO VMI modules without a ``T.Parallel``
   unit enter the same three PTO pass entry points, but are bypassed inside
-  those passes and accepted without conversion.
+  those passes and accepted without conversion;
+* ``PlanPtoSlotStorage`` is registered and runs on the PTO route (the
+  slot-storage planning stage before scheduling).
 
-This file deliberately asserts routing only: no PTO Parallel semantics, no
-lowering output, and no Fragment/slot, control-flow, or Reduce support. Use
+This file deliberately asserts routing only: no PTO Parallel semantics and
+no lowering output beyond the routed pass set. Use
 ``TL_PTO_ROUTING_TRACE_DIR=<dir>`` to dump the per-case ordered pass trace and
 the lowered kernel source as review artifacts.
 
@@ -28,6 +30,7 @@ import os
 import pytest
 
 import tilelang.ascend.language as T
+import tilelang.ascend.transform as ascend_transform
 from tilelang.ascend.target import (
     normalize_ascend_target,
     normalize_asc_target,
@@ -220,3 +223,13 @@ def test_pto_handwritten_vmi_without_parallel_is_accepted():
     for pass_name in _PTO_PARALLEL_PASSES:
         assert pass_name in names, f"{pass_name} missing on the PTO route; tail: {names[-12:]}"
     _maybe_dump_artifacts("pto-handwritten-vmi", names, artifact)
+
+_SLOT_STORAGE_PASS = "PlanPtoSlotStorage"
+
+
+@pytest.mark.pto
+def test_plan_pto_slot_storage_is_registered_and_runs_on_the_pto_route():
+    assert hasattr(ascend_transform, _SLOT_STORAGE_PASS), "PlanPtoSlotStorage is the slot-storage planning stage and must be registered"
+    artifact, names = _lower_with_trace(_simdvf_parallel_kernel(), "pto")
+    assert any(_SLOT_STORAGE_PASS in name for name in names), f"the PTO route must run PlanPtoSlotStorage; trace tail: {names[-12:]}"
+    _maybe_dump_artifacts("pto-slot-storage-presence", names, artifact)
