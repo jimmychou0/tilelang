@@ -1078,7 +1078,7 @@ private:
       ICHECK_GT(lanes, 0)
           << "fragment storage handle lost its declaration while "
              "checking the store";
-      if (!IsWholeEntryMultiple(op->args[2], lanes)) {
+      if (!pto::IsWholeEntryMultiple(op->args[2], lanes)) {
         std::ostringstream oss;
         oss << "explicit-mask vstore on a fragment storage handle uses "
                "element offset "
@@ -1181,31 +1181,6 @@ private:
   // Recursive divisibility proof: the simplified offset expression must
   // be a multiple of lanes (constants, products with a divisible const
   // factor, sums of multiples). Anything else fails closed.
-  static bool IsWholeEntryMultiple(const PrimExpr &expr, int64_t lanes) {
-    if (const int64_t *constant = as_const_int(expr)) {
-      return *constant % lanes == 0;
-    }
-    if (const auto *mul = expr.as<MulNode>()) {
-      const int64_t *lhs = as_const_int(mul->a);
-      const int64_t *rhs = as_const_int(mul->b);
-      if ((lhs != nullptr && *lhs % lanes == 0) ||
-          (rhs != nullptr && *rhs % lanes == 0)) {
-        return true;
-      }
-      return IsWholeEntryMultiple(mul->a, lanes) &&
-             IsWholeEntryMultiple(mul->b, lanes);
-    }
-    if (const auto *add = expr.as<AddNode>()) {
-      return IsWholeEntryMultiple(add->a, lanes) &&
-             IsWholeEntryMultiple(add->b, lanes);
-    }
-    if (const auto *sub = expr.as<SubNode>()) {
-      return IsWholeEntryMultiple(sub->a, lanes) &&
-             IsWholeEntryMultiple(sub->b, lanes);
-    }
-    return false;
-  }
-
   std::unordered_set<const VarNode *> ub_roots_;
   std::unordered_map<const VarNode *, PrimExpr> pointer_defs_;
   std::unordered_map<const VarNode *, PrimExpr> value_defs_;

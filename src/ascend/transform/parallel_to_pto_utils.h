@@ -166,6 +166,15 @@ PtoInverseMapping InvertPtoLaneLayout(const For &loop);
 Map<Var, Range> CollectEnclosingSerialRanges(const Stmt &stmt,
                                              const ForNode *unit);
 
+/*! \brief True when \p expr is provably a multiple of \p lanes.
+ *
+ * Shared by Vectorize's offset check and VerifyPTOCodegenLegality's
+ * store-alignment check — one implementation so the two proofs cannot
+ * drift apart. Handles constants and the Mul/Add/Sub spine with a
+ * constant multiple of `lanes` on either side of a Mul.
+ */
+bool IsWholeEntryMultiple(const PrimExpr &expr, int64_t lanes);
+
 /*! Classify one buffer access (load or store indices) against the inverse
  * mapping. \p indices are the buffer indices in the original loop body
  * expressed over the loop variable; \p loop_var is the original parallel

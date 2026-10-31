@@ -580,11 +580,11 @@ void CheckPtoSlotUnifiedBufferCapacity(const Stmt &body) {
   if (CollectAllSlotBackingVars(body).empty()) {
     return;
   }
-  // Mirrors GetSharedMemoryLimit in auto_schedule.cc: 248 KB physical UB
-  // minus the 32 KB SIMT_VF thread-context reservation when a SIMT_VF block
-  // is present.
-  constexpr int64_t kPhysicalUnifiedBufferSize = 248 * 1024;
-  constexpr int64_t kSimtVFThreadContextSize = 32 * 1024;
+  // The physical UB arena (kAscendUBMemoryBytes from target_utils.h)
+  // minus the SIMT_VF thread-context reservation (kAscendSimtContextBytes,
+  // same header) when a SIMT_VF block is present; mirrors
+  // GetSharedMemoryLimit in auto_schedule.cc.
+  constexpr int64_t kPhysicalUnifiedBufferSize = kAscendUBMemoryBytes;
   class SimtVFDetector : public tirx::StmtVisitor {
   public:
     bool found = false;
@@ -598,7 +598,7 @@ void CheckPtoSlotUnifiedBufferCapacity(const Stmt &body) {
   SimtVFDetector detector;
   detector(body);
   const int64_t limit =
-      detector.found ? kPhysicalUnifiedBufferSize - kSimtVFThreadContextSize
+      detector.found ? kPhysicalUnifiedBufferSize - kAscendSimtContextBytes
                      : kPhysicalUnifiedBufferSize;
 
   class DynShmemSizeCollector : public tirx::StmtVisitor {

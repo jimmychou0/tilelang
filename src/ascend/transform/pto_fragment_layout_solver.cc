@@ -549,7 +549,10 @@ private:
             }
             outer_->AddRegion(op, scan);
           }
-          return;  // Nested regions are handled at their own visit.
+          // Do not recurse into nested SIMD_VF blocks: each converting
+          // region is visited independently at its own SBlock (the outer
+          // visit does not need the inner region's units).
+          return;
         }
         tirx::StmtVisitor::VisitStmt_(op);
       }

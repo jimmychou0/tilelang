@@ -802,31 +802,6 @@ private:
       // into the product ((i*Q+q)*L canonicalizes to i*(Q*L)+q*L), so
       // matching the exact "x*L" shape rejects equivalent forms; prove
       // divisibility of the simplified expression instead.
-      static bool IsWholeEntryMultiple(const PrimExpr &expr, int64_t lanes) {
-        if (const int64_t *constant = as_const_int(expr)) {
-          return *constant % lanes == 0;
-        }
-        if (const auto *mul = expr.as<MulNode>()) {
-          const int64_t *lhs = as_const_int(mul->a);
-          const int64_t *rhs = as_const_int(mul->b);
-          if ((lhs != nullptr && *lhs % lanes == 0) ||
-              (rhs != nullptr && *rhs % lanes == 0)) {
-            return true;
-          }
-          return IsWholeEntryMultiple(mul->a, lanes) &&
-                 IsWholeEntryMultiple(mul->b, lanes);
-        }
-        if (const auto *add = expr.as<AddNode>()) {
-          return IsWholeEntryMultiple(add->a, lanes) &&
-                 IsWholeEntryMultiple(add->b, lanes);
-        }
-        if (const auto *sub = expr.as<SubNode>()) {
-          return IsWholeEntryMultiple(sub->a, lanes) &&
-                 IsWholeEntryMultiple(sub->b, lanes);
-        }
-        return false;
-      }
-
       void CheckEntryOffset(const PrimExpr &offset, int64_t size,
                             const PtoSlotPlan &plan, const VarNode *base) {
         const int64_t total = plan->count * plan->vector_lanes;
@@ -846,7 +821,7 @@ private:
         // into sums whose terms keep the same granularity. The range itself
         // was proven by Verify's interval proof; here only the granularity
         // matters (a non-multiple remainder would tear an entry).
-        ICHECK(IsWholeEntryMultiple(offset, plan->vector_lanes))
+        ICHECK(pto_analysis::IsWholeEntryMultiple(offset, plan->vector_lanes))
             << "[VectorizeParallelToPTO] internal error: access on `"
             << base->name_hint << "` uses offset " << offset
             << ", which is not entry * lanes granularity";

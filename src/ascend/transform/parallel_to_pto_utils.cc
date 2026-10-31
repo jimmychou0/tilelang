@@ -151,6 +151,31 @@ Map<Var, Range> CollectEnclosingSerialRanges(const Stmt &stmt,
   return ranges;
 }
 
+bool IsWholeEntryMultiple(const PrimExpr &expr, int64_t lanes) {
+  if (const int64_t *constant = as_const_int(expr)) {
+    return *constant % lanes == 0;
+  }
+  if (const auto *mul = expr.as<MulNode>()) {
+    const int64_t *lhs = as_const_int(mul->a);
+    const int64_t *rhs = as_const_int(mul->b);
+    if ((lhs != nullptr && *lhs % lanes == 0) ||
+        (rhs != nullptr && *rhs % lanes == 0)) {
+      return true;
+    }
+    return IsWholeEntryMultiple(mul->a, lanes) &&
+           IsWholeEntryMultiple(mul->b, lanes);
+  }
+  if (const auto *add = expr.as<AddNode>()) {
+    return IsWholeEntryMultiple(add->a, lanes) &&
+           IsWholeEntryMultiple(add->b, lanes);
+  }
+  if (const auto *sub = expr.as<SubNode>()) {
+    return IsWholeEntryMultiple(sub->a, lanes) &&
+           IsWholeEntryMultiple(sub->b, lanes);
+  }
+  return false;
+}
+
 PtoInverseMapping InvertPtoLaneLayout(const For &loop) {
   auto anno = loop->annotations.Get(attr::kPtoParallelLoopLayout);
   if (!anno.has_value()) {

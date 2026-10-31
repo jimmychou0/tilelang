@@ -32,6 +32,8 @@
 #include <sstream>
 #include <string>
 
+#include "span_utils.h"
+
 #include "../../op/copy.h"
 #include "../../op/fill.h"
 #include "../../op/operator.h"
@@ -102,7 +104,8 @@ Stmt StripLoopAnnotations(const Stmt &stmt) {
     if (body.same_as(loop->body) && loop->annotations.empty()) {
       return stmt;
     }
-    return For(loop->loop_var, loop->min, loop->extent, loop->kind, body);
+    return For(loop->loop_var, loop->min, loop->extent, loop->kind, body,
+               std::nullopt, {}, std::nullopt, loop->span);
   }
   return stmt;
 }
@@ -184,8 +187,10 @@ For BuildPredicatedFill(const Buffer &dst, int64_t region_min,
       (idx < IntImm(ity, static_cast<int>(region_min + region_extent)));
   Stmt body =
       IfThenElse(cond, BufferStore(dst, value, {idx}));
-  return For(i, IntImm(ity, 0), IntImm(ity, static_cast<int>(padded)),
-             ForKind::kParallel, body);
+  Stmt loop = For(i, IntImm(ity, 0), IntImm(ity, static_cast<int>(padded)),
+                  ForKind::kParallel, body);
+  StampSubtreeSpans(loop, dst->span);
+  return loop;
 }
 
 For BuildPredicatedCopy(const Buffer &src, int64_t src_min, const Buffer &dst,
@@ -209,8 +214,10 @@ For BuildPredicatedCopy(const Buffer &src, int64_t src_min, const Buffer &dst,
     value = Cast(dst->dtype, value);
   }
   Stmt body = IfThenElse(cond, BufferStore(dst, value, {dst_idx}));
-  return For(i, IntImm(ity, 0), IntImm(ity, static_cast<int>(padded)),
-             ForKind::kParallel, body);
+  Stmt loop = For(i, IntImm(ity, 0), IntImm(ity, static_cast<int>(padded)),
+                  ForKind::kParallel, body);
+  StampSubtreeSpans(loop, dst->span);
+  return loop;
 }
 
 class RegionExpander : public StmtExprMutator {
@@ -274,7 +281,12 @@ private:
       }
       arith::Analyzer analyzer;
       Stmt expanded = node->MakeSIMTLoop(&analyzer);
-      return StripLoopAnnotations(expanded);
+      expanded = StripLoopAnnotations(expanded);
+      // The expanded loops are constructed from scratch (no source spans);
+      // stamp the original fill/copy call's span so later passes' error
+      // messages keep pointing at the user's source location.
+      StampSubtreeSpans(expanded, op->span);
+      return expanded;
     }
     if (auto copy = tile_op.as<Copy>()) {
       const CopyNode *node = copy.value().get();
@@ -285,7 +297,12 @@ private:
       }
       arith::Analyzer analyzer;
       Stmt expanded = node->MakeSIMTLoop(&analyzer);
-      return StripLoopAnnotations(expanded);
+      expanded = StripLoopAnnotations(expanded);
+      // The expanded loops are constructed from scratch (no source spans);
+      // stamp the original fill/copy call's span so later passes' error
+      // messages keep pointing at the user's source location.
+      StampSubtreeSpans(expanded, op->span);
+      return expanded;
     }
     ICHECK(false) << "[ExpandPtoFragmentFillCopy] internal error: " << name
                   << " parsed as an unexpected operator type";
@@ -357,9 +374,12 @@ private:
     const int64_t *sext_p = node->src_range.size() == 1u
                                  ? as_const_int(node->src_range[0]->extent)
                                  : nullptr;
+    // A non-constant src extent (sext_p == nullptr) also falls through:
+    // the loop is driven by the dst extent, and an unprovable src extent
+    // means the read cannot be shown to stay in range.
     if (dst_frag && src_frag && lanes_ > 0 &&
-        *dmin_p % lanes_ == *smin_p % lanes_ &&
-        (sext_p == nullptr || *sext_p == *dext_p)) {
+        *dmin_p % lanes_ == *smin_p % lanes_ && sext_p != nullptr &&
+        *sext_p == *dext_p) {
       return BuildPredicatedCopy(node->src, *smin_p, node->dst, *dmin_p,
                                  *dext_p, lanes_);
     }
@@ -407,7 +427,7 @@ private:
       }
       return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
                     expanded, op->init, op->alloc_buffers, op->match_buffers,
-                    op->annotations);
+                    op->annotations, op->span);
     }
     return StmtExprMutator::VisitStmt_(op);
   }
