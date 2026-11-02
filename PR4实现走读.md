@@ -199,43 +199,65 @@ Run(body)
 
 ---
 
-## 3. ⑥ PlanPtoSlotStorage：量地、发证
+## 3. ⑥ PlanPtoSlotStorage：把布局变成账本
 
 **代码位置**：pass 主体 [plan_pto_slot_storage.cc](src/ascend/transform/plan_pto_slot_storage.cc)；count 读取 [EntryCountFromLayout:377](src/ascend/transform/plan_pto_slot_storage.cc#L377)；记录结构 [pto_slot_plan.h:49（PtoSlotPlanNode）](src/ascend/transform/pto_slot_plan.h#L49)、对齐常量 [kPtoSlotAlignmentBytes:37](src/ascend/transform/pto_slot_plan.h#L37)。
 
-Stage 4 定了布局，但 fragment 还是逻辑对象。本 pass 是**土地测量员兼会计**：只添账本，不动程序一行。
+### 3.1 问题：④ 结束时 fragment 还是逻辑对象
 
-造两样东西（sv3 dump）：
+布局求解定了"哪维当 lane"，但 IR 里 fragment 只是个 scope 标记——**没有存储实体**。三个问题等着回答：放哪（物理空间）？多大（字节数）？谁知道（下游消费者拿什么参数）？本 pass 全部回答，方式是**只登记、不动程序一行**（对比 ⑩ 会大改程序）。
+
+### 3.2 产出两样东西（sv3 dump 实证）
 
 ```python
-acc_slot_backing = T.sblock_alloc_buffer((1024,), scope="shared.dyn")  # 土地（物理身体）
-T.sblock_attr({..., "tl.pto_slot_plan": [...]})                        # 证照
+acc_slot_backing = T.sblock_alloc_buffer((1024,), scope="shared.dyn")  # ① 物理身体
+T.sblock_attr({..., "tl.pto_slot_plan": [...]})                        # ② 记账记录
 ```
 
-**backing 是 `shared.dyn`**——只有 shared.dyn 进 MergeUB 统一合并与容量核算，这是可被地址 pass 改写、进容量体系的前提。
+**① backing = fragment 的物理身体**。名字固定 `fragment名_slot_backing`，大小 = count × VL × 元素字节（sv3：8×128×4B=4096）。为什么是 `shared.dyn`：只有 shared.dyn 进 MergeUB 的统一合并与容量核算——选别的 scope 就游离在地址体系之外，后续谁都改写不了它。
 
-**PtoSlotPlan 字段与消费者**：
+**② plan 注解 = 一张五字段证照**，每个字段都有明确消费者：
 
-| 字段 | sv3 的值 | 谁读 |
+| 字段 | sv3 的值 | 谁读、读去干什么 |
 |---|---|---|
-| fragment / backing | acc / acc_slot_backing | 所有人（对象级对应） |
-| count | 8 | Vectorize 声明、容量检查 |
-| vector_lanes | 128 | Vectorize（vload size） |
-| fragment_mem_var | handle 名 | Vectorize 每区域造全新同名 Var |
-| vector_type_name | "float32x128" | 校验访问类型一致 |
-| bytes（32 对齐） | 4096 | AutoSchedule 预算、Merge 容量 |
+| fragment / backing | acc / acc_slot_backing | 所有人——对象级对应关系 |
+| count | 8 | ⑩ 声明的参数；容量终检的上限 |
+| vector_lanes | 128 | ⑩ vload/vstore 的 size |
+| fragment_mem_var | handle 名 | ⑩ 用它**现造全新 Var** 绑定（plan 只出名字不出变量——名字是 plan 级标识、变量是区域级产物，防重复 Bind） |
+| bytes（32B 对齐） | 4096 | AutoSchedule 扣预算；Merge 终检 |
 
-**count 公式**（`其余维积 × ceil(lane维/VL)`，永不用 元素数/VL）——ragged 形状必须按 entry 分配：
+### 3.3 唯一的数学：count 公式（唯一容易算错的地方）
 
 ```
+count = 其余维积 × ceil(lane维/VL)        永远不用 元素总数/VL
+
 f = [4,130]，VL=64，lane 维=dim1：
-  count = 4 × ceil(130/64) = 12     ← 第 3 个 entry 只用 8 lane，也占整格
-  错误算法 4×130/64 = 8.125→8       ← 少算 4 个 entry，越界写进邻居
+  count = 4 × ceil(130/64) = 12     ← 第 3 个 entry 只用 8 条 lane，也占整格
+  错误算法 4×130/64 = 8.125 → 8     ← 少算 4 个 entry = 越界写进邻居 buffer
 ```
 
-**位置**：在 AutoSchedule **之前**——预算扣减必须先于"普通 buffer 能否双缓冲"的决策。**本 pass 只登记不分地址**：具体字节地址（sv3 PTODSL 里 `memref_declare(20480,...)` 的 20480）由 MergeUB 统一分配，保证所有 shared.dyn 两两不相交（容量测试直接从最终模块的声明地址断言）。
+物理原因：**存储按 entry 分格，一格 = VL 条 lane 的空间，尾巴不满也占整格**。这个公式不是估算精度问题，是内存安全问题。
 
-防护：A6 规范形态断言（恰一 entry 维 / replicate==1 / 常量正 thread extent——怪布局进来 count 会算错）；count×lanes 溢出检查；一块 fragment 只发一张证。
+### 3.4 登记与分地址分离（位置设计）
+
+本 pass 在流水线里的位置由两个"必须先后"决定：
+
+```
+⑥ Plan            AutoSchedule              MergeUB
+登记：这块地归     扣减：剩余 = 上限 − Σbytes   分配：给所有 shared.dyn 排具体地址
+fragment 名下、    （双缓冲决策看到真实余量）    （含 backing；两两不相交在此
+大小多少                                         一次全局解决）
+    │                 │                          │
+    └─ 必须在调度前：否则调度器按满额批双缓冲，   └─ sv3 的 20480 字节地址
+       加 backing 超容量——到 Merge 才炸，          在这里诞生
+       报错点离决策点十万八千里
+```
+
+**本 pass 只量地、不发地契**：具体字节地址由 MergeUB 统一分配。好处是"所有 shared.dyn（普通 buffer + 全部 backing）两两不相交"不需要 fragment 自己证明，一次性全局解决；验收也因此可以从**最终模块的声明地址直接断言**（容量测试就这么做的，比查中间账本硬）。
+
+### 3.5 防护
+
+A6 规范形态断言（恰一 entry 维 / replicate==1 / 常量正 thread extent——怪布局进来 count 会算错，宁可在门口拒）；count×lanes 溢出检查；一块 fragment 只发一张证（对象去重）。
 
 ### ⑥配套难点：UB 预留与独占分配（D3 预算 + D4 独占）
 
@@ -271,32 +293,28 @@ MergeUB：统一地址空间排地址（backing 独占，不参与复用）
 
 ---
 
-## 4. ⑧ 证明与校验：一个证明，两个消费者
+## 4. ⑧ 证明与校验：求解器与 Verify 共用的一道安检
 
-**代码位置**：证明本体 [parallel_to_pto_utils.cc:639（AnalyzeFragmentAccess）](src/ascend/transform/parallel_to_pto_utils.cc#L639)；UB 侧同框架 [:489（AnalyzeBufferAccess）](src/ascend/transform/parallel_to_pto_utils.cc#L489)；范围收集 [:93（CollectEnclosingSerialRanges）](src/ascend/transform/parallel_to_pto_utils.cc#L93)；消费方之一 [verify_parallel_to_pto.cc:1073 附近（fragment 分支）](src/ascend/transform/verify_parallel_to_pto.cc#L1073)、另一消费方即求解器的 `FragmentDirectionFeasible`。
+> **本节的完整展开在《[PR4布局求解器详解](PR4布局求解器详解.md)》**——代换原理（其 §3）、entry/storage_lane 表达式怎么算（其 §5.0）、三件事证明逐条（其 §5.1–5.3）、为什么一个证明两个消费者（其 §10，含分叉实例推演）。此处只讲流水线层面 ⑧ 扮演的角色。
 
-两个文件一个职责：`AnalyzeFragmentAccess`（证明本体）+ `VerifyParallelToPTO`（跑证明的安检门，以前"见 fragment 就拒"，现在真正逐访存跑证明）。
+**代码位置**：证明本体 [parallel_to_pto_utils.cc:639（AnalyzeFragmentAccess）](src/ascend/transform/parallel_to_pto_utils.cc#L639)；UB 侧同框架 [:489（AnalyzeBufferAccess）](src/ascend/transform/parallel_to_pto_utils.cc#L489)；范围收集 [:93（CollectEnclosingSerialRanges）](src/ascend/transform/parallel_to_pto_utils.cc#L93)；Verify 的 fragment 分支 [verify_parallel_to_pto.cc:1073 附近](src/ascend/transform/verify_parallel_to_pto.cc#L1073)。
 
-两条铁律：**证不出 = 拒绝**（fail-closed）；**双侧**（上下界都要证）。
+### 4.1 ⑧ 在流水线里干什么
 
-**道具 1 代换**：被选变量 = `q×VL + lane`，代换后用布局正向映射换算出"存储 lane / entry"两个表达式，对它们做证明。
+Verify 是 **Vectorize 之前的安检门**：以前"见 fragment 就拒"（fragment 没有物理实现），现在逐访存跑三件事证明（lane 匹配 / entry 与 lane 无关 / entry 双侧区间），全过才放行改写。两条铁律：**证不出 = 拒绝**（fail-closed）、**双侧**（上下界都证）。它同时检查求解器不管的东西：跨 SIMD_VF 共享 fragment、lane 偏移/区域级单元素提取、UB 访存的连续性分类（`AnalyzeBufferAccess`）。
 
-**道具 2 证明域**：lane / q / 保留维 / **全部外层串行循环范围**（`CollectEnclosingSerialRanges` 收集，穿 if/while）。不绑范围，`f[k,j]` 的 entry<k 就证不出——历史上两类真 bug：不绑 kernel 级循环（误拒 f[k,j]）、范围收集不穿 if（for k: if…: f[k,j] 误拒）。
+### 4.2 与求解器的关系：一个证明、两个消费者（一句话版）
 
-**三件事证明**（真实报文示例）：
+求解器投票时**试探性地**调用同一证明（"这个候选方向证得过吗"），Verify 放行前**复核性地**再调（"最终布局下每个访存证得过吗"）——**同一个函数、绑同一套范围集，判定不可能分叉**；求解器在流水线前面先报，报错点固定、文案可测试。完整的"为什么不能各写一套 + 分叉会是什么样"，见求解器详解 §10。
 
-| 证明 | 问什么 | 反例与真实报文 |
-|---|---|---|
-| (a) lane 匹配 | 存储位置 == 执行位置 | `keep[i, j+1]`：j=127 时存储 lane=0≠127。方向 j 死于此、方向 i 死于 entry 区间 → 报"no feasible direction"（真实报文） |
-| (b) entry 无关 lane | entry(lane=0) == entry(lane) | 一轮内 lane 被劈到两个 entry，一次 vload 表达不了（保险丝） |
-| (c) entry 区间 | 0 ≤ entry < count | `keep[k,j]` k∈[0,8) 而 f 只有 4 行：真实报文 "the slot entry index (k) is not provably within [0, 4)"；`f[i+128]` 多 chunk：entry=q+1 在 q=1 时 = count ❌ |
+### 4.3 真实报文（负例速览，详见求解器详解 §5.3）
 
+```text
+keep[i, j+1]     → "no feasible direction once ... combined"（两方向各死一次）
+keep[k, j]（f 4 行，k∈[0,8)）
+                 → "the slot entry index (k) is not provably within [0, 4)"
+f[i+128]         → entry = q+1 在最后 chunk 越上界
 ```
-AnalyzeFragmentAccess:  解bind别名 → 下标合法性 → 代换 → 套布局映射 → 绑证明域
-                        → 证(a) → 证(b) → 证(c) → 全过返回（带 entry 表达式供转换用）
-```
-
-**设计灵魂**：求解器投票（候选布局下试探）与 Verify 放行（最终布局下复核）**用同一个函数、绑同一个范围集**——判定不可能分叉；且求解器先报，报错点确定、文案稳定可测试。若各写一套（历史上出现过），"求解器放行 Verify 拒"或反之都可能出现。
 
 ---
 
@@ -320,15 +338,42 @@ for k in range(4):                        for k, i, q in T.grid(4, 8, 1):
 
 j 塌缩进 128 条 lane；i 保留为循环；**q 是 chunk 维**（ragged 时 `ceil(lane维/VL)` 个轮次，尾部 chunk 的 store mask 只有前若干位为 1）。
 
-### 声明：每区域一次、全新 Var
+### 声明：handle 的诞生（每区域一次、每次现造新变量）
+
+先看懂这行代码本身——它把 ⑥ 的证照兑换成一条"存储句柄"定义：
 
 ```python
 keep_fragment_mem: T.handle = T.tl.vmi.declare_fragment_buffer(
-    T.access_ptr(keep_slot_backing[0], 128, 3),  # backing 地址（⑥证照）
-    T.int64(1), T.int64(128))                    # count、lanes（⑥证照）
+    T.access_ptr(keep_slot_backing[0], 128, 3),  # ① backing 地址：从 backing 第 0 个
+    )                                             #    元素起、128 个元素、权限3=读写
+    T.int64(1), T.int64(128))                     # ② count=1 格、lanes=128（都来自证照）
+
+# keep_fragment_mem 从此是 vload/vstore 的基址——它是"句柄"不是数据，
+# 只能出现在访存指令的基址位置（⑨ 会核验这一点）
 ```
 
-vecscope 分裂会让一个 plan 对应多个区域 → 每区域各声明一次、用 plan 里的名字**现造全新 Var**（同一 Var 绑两次违反 SSA）。
+**"区域"是什么**：一个 `with T.SimdVF(...)` 块就是一个转换区域。声明必须放在**区域开头、作用域之内**——因为 VPTO 把 vecscope 数据视为 region-local，区域外的引用直接非法。
+
+**为什么说"每区域一次"——现在的答案是：每 plan 恰好一次**。当前实现里 **vecscope 分裂已由 base 退役**（重构二十一轮）：区域**整体转换**，串行循环不再被提升出区域、不再劈出多个 vecscope——跨迭代保序全部交给 ptoas 自动 bar（PR374 已验证覆盖，包括跨迭代 RAW）。所以一块 fragment 的 plan 恰好对应一个区域、一次声明；tour sv3 的实测 dump 就是这个形态：
+
+```
+with vecscope:                          ← 一个区域，没分裂
+    acc_fragment_mem = declare(...)     ← 恰好一次声明
+    for k, i, q in grid(4,8,1):         ← 串行 k 留在区域内
+        ...vload/vstore acc_fragment_mem...  （跨迭代保序 = ptoas 的 bar）
+```
+
+**"全新 Var"机制保留为防御**。历史上（分裂还在的旧 base）一个 plan 会被劈成多个区域，每区域要重新声明——同一变量绑两次违反 SSA 单定义，所以每区域用 plan 里的名字现造全新变量。分裂退役后这套机制不再被触发，但实现保留（[SlotState 的注释](src/ascend/transform/vectorize_parallel_to_pto.cc#L443)记录了原始理由），防止未来分裂回归时静默产生重复 Bind——codegen 侧另有重复定义检查兜底。这也是 ⑥ 证照**只存名字不存变量**的原因：名字是 plan 级的稳定标识，变量是区域级的运行时产物。
+
+**为什么"每次现造全新 Var"**：分裂出四个区域，就有四次 `declare(...)`。如果四次都绑定**同一个**变量 `acc_fragment_mem`，那这个变量就被定义了四次——**违反 SSA 单定义**（一个变量恰好一次定义，是 IR 的基本纪律，重复定义会让下游所有分析失效）。所以每个区域用 plan 里的名字**现造一个全新的变量**（名字相同、身份不同）：
+
+```
+区域1: acc_fragment_mem_v1 = declare(backing, 1, 128)   # 新变量
+区域2: acc_fragment_mem_v2 = declare(backing, 1, 128)   # 又一个新变量
+   ...（名字都来自证照的 fragment_mem_var，但各是独立变量）
+```
+
+**关键：这不是四块存储，还是一块**。每次 declare 的参数完全相同——同一个 backing 地址、同一个 count——四个句柄指向**同一块物理存储**，声明只是"这块区域内的访存从这里走"的入口票据。这也是 ⑥ 证照里只存名字、不存变量的原因：变量是区域级的，名字才是 plan 级的。
 
 ### 访存转换的三个细节
 
