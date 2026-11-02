@@ -190,7 +190,7 @@ For BuildPredicatedFill(const Buffer &dst, int64_t region_min,
   Stmt loop = For(i, IntImm(ity, 0), IntImm(ity, static_cast<int>(padded)),
                   ForKind::kParallel, body);
   StampSubtreeSpans(loop, dst->span);
-  return loop;
+  return Downcast<For>(loop);
 }
 
 For BuildPredicatedCopy(const Buffer &src, int64_t src_min, const Buffer &dst,
@@ -217,7 +217,7 @@ For BuildPredicatedCopy(const Buffer &src, int64_t src_min, const Buffer &dst,
   Stmt loop = For(i, IntImm(ity, 0), IntImm(ity, static_cast<int>(padded)),
                   ForKind::kParallel, body);
   StampSubtreeSpans(loop, dst->span);
-  return loop;
+  return Downcast<For>(loop);
 }
 
 class RegionExpander : public StmtExprMutator {

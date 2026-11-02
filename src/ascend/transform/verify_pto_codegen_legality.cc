@@ -40,6 +40,8 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include "parallel_to_pto_utils.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <optional>
@@ -1078,7 +1080,7 @@ private:
       ICHECK_GT(lanes, 0)
           << "fragment storage handle lost its declaration while "
              "checking the store";
-      if (!pto::IsWholeEntryMultiple(op->args[2], lanes)) {
+      if (!tl::pto::IsWholeEntryMultiple(op->args[2], lanes)) {
         std::ostringstream oss;
         oss << "explicit-mask vstore on a fragment storage handle uses "
                "element offset "

@@ -13,8 +13,8 @@ Scope: this file proves routing only.
 * ``PlanPtoSlotStorage`` is registered and runs on the PTO route (the
   slot-storage planning stage before scheduling).
 
-This file deliberately asserts routing only: no PTO Parallel semantics and
-no lowering output beyond the routed pass set. Use
+This file deliberately asserts routing only: no PTO Parallel semantics, no
+lowering output, and no Fragment/slot, control-flow, or Reduce support. Use
 ``TL_PTO_ROUTING_TRACE_DIR=<dir>`` to dump the per-case ordered pass trace and
 the lowered kernel source as review artifacts.
 

@@ -927,9 +927,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
             << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
             << "\" capacity is negative (" << capacity
             << "). Non-eligible and fixed-version buffers already exceed"
-            << " the memory limit; reduce buffer sizes (raising the "
-               "limit only defers the failure to the final capacity "
-               "check, it does not make the kernel fit the device)";
+            << " the memory limit. Try using T.annotate_unlimit_memory(\""
+            << group_scopes[g] << "\") or reduce buffer sizes.";
       }
       int64_t min_usage = 0;
       for (int64_t idx : idxs) {
