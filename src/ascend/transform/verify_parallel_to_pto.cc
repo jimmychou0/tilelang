@@ -31,8 +31,10 @@
 #include <sstream>
 #include <vector>
 
+#include "../../op/operator.h"
 #include "../../transform/common/attr.h"
 #include "parallel_to_pto_utils.h"
+#include "pto_slot_plan.h"
 
 namespace tvm {
 namespace tl {
@@ -180,6 +182,30 @@ private:
         if (name == "tl.tileop.reduce") {
           parent_->Fail("expression", "cross-lane reduce is not supported");
         }
+        if (name == "tl.tileop.fill" || name == "tl.tileop.copy" ||
+            name == "tl.tileop.ascend_copy") {
+          // Fragment-touching fill/copy is expanded into T.Parallel loops
+          // before layout inference, so a survivor here means the
+          // expansion missed a position; initialize the fragment through a
+          // T.Parallel unit instead.
+          const Call call = GetRef<Call>(op);
+          bool touches_fragment = false;
+          PostOrderVisit(call, [&](const ObjectRef &node) {
+            if (const auto *load = node.as<BufferLoadNode>()) {
+              if (load->buffer.scope() == "local.fragment") {
+                touches_fragment = true;
+              }
+            }
+          });
+          if (touches_fragment) {
+            std::ostringstream oss;
+            oss << name
+                << " on fragment buffers reached Verify unexpanded; "
+                   "initialize the fragment through a T.Parallel unit "
+                   "instead";
+            parent_->Fail("fragment access", oss.str());
+          }
+        }
       }
       StmtExprVisitor::VisitExpr_(op);
     }
@@ -250,7 +276,15 @@ private:
       if (parallel) {
         ++parallel_depth_;
       }
+      // Fragment accesses are only admitted inside the converting Parallel
+      // unit bodies (CheckScope consumes this flag); the unit bodies are
+      // where the whole-entry slot read/write form exists.
+      const bool saved_inside_unit = inside_parallel_unit_;
+      if (parallel) {
+        inside_parallel_unit_ = true;
+      }
       StmtExprVisitor::VisitStmt_(op);
+      inside_parallel_unit_ = saved_inside_unit;
       if (parallel) {
         --parallel_depth_;
       }
@@ -267,7 +301,7 @@ private:
         std::ostringstream oss;
         oss << "buffer `" << buffer->name
             << "` is allocated with the tirx.volatile annotation; volatile "
-               "accesses are not yet supported";
+               "accesses are not supported in the first version";
         parent_->Fail("memory access", oss.str());
       }
       const std::string &scope = buffer.scope();
@@ -294,6 +328,46 @@ private:
         }
         return;
       }
+      if (scope == "local.fragment") {
+        // Slot storage path. Admitted only with a layout_map entry and a
+        // slot plan in scope, and only inside the converting Parallel unit
+        // bodies: a region-level fragment access is a single-element
+        // extract with no whole-entry slot form. The per-access entry/lane
+        // mapping proof runs in the unit visitor.
+        if (!inside_parallel_unit_) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name
+              << "` is accessed outside the converting T.Parallel bodies; "
+                 "region-level fragment accesses (single-element reads or "
+                 "writes) have no slot lowering";
+          parent_->Fail("fragment access", oss.str());
+        }
+        if (!parent_->FindFragmentLayoutInScope(buffer).defined()) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name
+              << "` has no layout_map entry in scope; the PTO layout "
+                 "inference must produce one for every fragment buffer "
+                 "accessed by a converting region";
+          parent_->Fail("fragment access", oss.str());
+        }
+        if (!parent_->FindSlotPlanInScope(buffer).has_value()) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name
+              << "` has no slot plan in scope. Either the buffer is "
+                 "shared across SIMD_VF regions (a fragment must stay "
+                 "inside the single region that owns it), or the "
+                 "PlanPtoSlotStorage stage was dropped from the pipeline";
+          parent_->Fail("fragment access", oss.str());
+        }
+        if (!pto_analysis::IsSupportedElementDType(buffer->dtype)) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name << "` element dtype "
+              << buffer->dtype
+              << " is not supported by the unified element addressing";
+          parent_->Fail("dtype", oss.str());
+        }
+        return;
+      }
       // The remaining scopes only support UB accesses. local /
       // shared.l1 (L1) and other scopes are rejected.
       if (scope != "shared" && scope != "shared.dyn") {
@@ -313,6 +387,9 @@ private:
     }
     VerifyParallelToPTOImpl *parent_;
     int parallel_depth_ = 0;
+    /*! True while visiting the body of a Parallel For (a converting unit);
+     * fragment accesses are only legal there. */
+    bool inside_parallel_unit_ = false;
   };
 
   // ------------------------------------------------------------------
@@ -322,9 +399,11 @@ private:
   public:
     UnitVisitor(VerifyParallelToPTOImpl *parent, const Var &loop_var,
                 const pto_analysis::PtoInverseMapping &mapping,
-                const std::set<const VarNode *> &external_defs)
+                const std::set<const VarNode *> &external_defs,
+                const Map<Var, Range> &region_loop_ranges)
         : parent_(parent), loop_var_(loop_var), mapping_(mapping),
-          external_defs_(external_defs) {
+          external_defs_(external_defs),
+          outer_loop_ranges_(region_loop_ranges) {
       // In a 2D unit `loop_var` is the vectorized coordinate; the
       // other one is kept as a serial loop and classifies as uniform.
       if (mapping.is_2d) {
@@ -428,9 +507,13 @@ private:
       }
       defined_loop_vars_.insert(op->loop_var.get());
       Map<Var, Integer> saved_classified = classified_;
+      Map<Var, Range> saved_ranges = outer_loop_ranges_;
       classified_.Set(op->loop_var, Integer(0));
+      outer_loop_ranges_.Set(op->loop_var,
+                             Range::FromMinExtent(op->min, op->extent));
       StmtExprVisitor::VisitStmt_(op);
       classified_ = std::move(saved_classified);
+      outer_loop_ranges_ = std::move(saved_ranges);
       defined_loop_vars_.erase(op->loop_var.get());
     }
     void VisitStmt_(const IfThenElseNode *op) final {
@@ -546,6 +629,13 @@ private:
       ctx.analyzer = &analyzer_;
       ctx.bind_env = bind_env_;
       ctx.external_defs = external_defs_;
+      // Fragment loads in value positions classify against the solved
+      // slot layout in scope (R4 §3.6) instead of the UB address proof,
+      // with the same outer-loop ranges the access check binds.
+      ctx.fragment_layout_lookup = [this](const tirx::Buffer &buffer) {
+        return parent_->FindFragmentLayoutInScope(buffer);
+      };
+      ctx.outer_loop_ranges = outer_loop_ranges_;
       ctx.classified = classified_;
       return ctx;
     }
@@ -977,6 +1067,49 @@ private:
         }
         return;
       }
+      // The predicate gate above already rejected non-trivial predicates
+      // for every scope, so no conditional fragment store reaches here;
+      // only unconditional whole-entry stores are converted.
+      if (buffer.scope() == "local.fragment") {
+        const Fragment layout = parent_->FindFragmentLayoutInScope(buffer);
+        if (!layout.defined()) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name
+              << "` has no layout_map entry in scope";
+          parent_->Fail("fragment access", oss.str());
+        }
+        const Optional<PtoSlotPlan> plan = parent_->FindSlotPlanInScope(buffer);
+        if (!plan.has_value()) {
+          std::ostringstream oss;
+          oss << "fragment buffer `" << buffer->name
+              << "` has no tl.pto_slot_plan record in scope";
+          parent_->Fail("fragment access", oss.str());
+        }
+        // Plan/layout consistency: both derive from the same inference
+        // (layout by InferPtoSimdLayout, plan by PlanPtoSlotStorage), so a
+        // mismatch means the pipeline reordered or mutated one of them —
+        // a defect, not a user-input error.
+        {
+          const Array<PrimExpr> output_shape = layout->OutputShape();
+          const int64_t *entry_count = as_const_int(output_shape[0]);
+          ICHECK(entry_count != nullptr && *entry_count == plan.value()->count)
+              << "[VerifyParallelToPTO] internal error: slot plan for `"
+              << buffer->name << "` reserves " << plan.value()->count
+              << " entries but its layout provides " << output_shape[0];
+          ICHECK_EQ(plan.value()->vector_lanes, mapping_.lanes)
+              << "[VerifyParallelToPTO] internal error: slot plan for `"
+              << buffer->name << "` uses lanes " << plan.value()->vector_lanes
+              << " but the unit mapping has " << mapping_.lanes;
+        }
+        try {
+          pto_analysis::AnalyzeFragmentAccess(
+              buffer, indices, is_write, loop_var_, mapping_, layout,
+              &analyzer_, bind_env_, outer_loop_ranges_);
+        } catch (const pto_analysis::PtoAnalysisError &err) {
+          parent_->Fail("fragment access", err.what());
+        }
+        return;
+      }
       try {
         auto access = pto_analysis::AnalyzeBufferAccess(
             buffer, indices, is_write, loop_var_, mapping_, &analyzer_,
@@ -1021,6 +1154,12 @@ private:
     // T.serial inside T.Parallel). In scope only while the shell's body
     // is being visited; classified as lane-uniform.
     std::set<const VarNode *> defined_loop_vars_;
+    // Ranges of every serial loop var in scope at the current access —
+    // both the region-level wrappers around the unit (seeded from the
+    // impl at construction) and the in-unit shells (bound as their bodies
+    // are visited). The fragment entry-interval proof binds these so an
+    // entry that depends on an outer loop (f[k, j]) is provable.
+    Map<Var, Range> outer_loop_ranges_;
   };
 
   // ------------------------------------------------------------------
@@ -1036,7 +1175,17 @@ private:
     if (op->kind != ForKind::kParallel) {
       std::set<const VarNode *> saved = defs_;
       defs_.insert(op->loop_var.get());
+      // Kernel-level serial loops stay in scope for nested regions: bind
+      // the range so a fragment entry depending on them (f[b, j]) proves
+      // its interval exactly as WalkRegion's region-level wrappers do.
+      Map<Var, Range> saved_ranges = region_loop_ranges_;
+      if (op->min.as<IntImmNode>() != nullptr &&
+          op->extent.as<IntImmNode>() != nullptr) {
+        region_loop_ranges_.Set(
+            op->loop_var, Range::FromMinExtent(op->min, op->extent));
+      }
       StmtExprVisitor::VisitStmt_(op);
+      region_loop_ranges_ = std::move(saved_ranges);
       defs_ = std::move(saved);
       return;
     }
@@ -1115,11 +1264,57 @@ private:
       for (const auto &buf : op->alloc_buffers) {
         defs_.insert(buf->data.get());
       }
+      block_stack_.push_back(op);
       StmtExprVisitor::VisitStmt_(op);
+      block_stack_.pop_back();
       defs_ = std::move(saved);
       return;
     }
+    block_stack_.push_back(op);
     HandleSimdVF(op);
+    block_stack_.pop_back();
+  }
+
+  // SBlocks in lexical scope, innermost last. Fragment layouts (layout_map)
+  // and slot plans may be recorded on the converting region's own SBlock or
+  // on an ancestor; lookups walk the chain so either placement works.
+  std::vector<const SBlockNode *> block_stack_;
+
+  Fragment FindFragmentLayoutInScope(const Buffer &buffer) const {
+    for (auto it = block_stack_.rbegin(); it != block_stack_.rend(); ++it) {
+      auto value = (*it)->annotations.Get(attr::kLayoutMap);
+      if (!value.has_value()) {
+        continue;
+      }
+      auto map = value.value().try_cast<LayoutMap>();
+      if (!map.has_value()) {
+        continue;
+      }
+      if (map.value().count(buffer) != 0) {
+        auto frag = map.value()[buffer].as<Fragment>();
+        return frag.has_value() ? frag.value() : Fragment();
+      }
+    }
+    return Fragment();
+  }
+
+  Optional<PtoSlotPlan> FindSlotPlanInScope(const Buffer &buffer) const {
+    for (auto it = block_stack_.rbegin(); it != block_stack_.rend(); ++it) {
+      auto value = (*it)->annotations.Get(kPtoSlotPlan);
+      if (!value.has_value()) {
+        continue;
+      }
+      auto plans = value.value().try_cast<Array<PtoSlotPlan>>();
+      if (!plans.has_value()) {
+        continue;
+      }
+      for (const auto &plan : plans.value()) {
+        if (plan->fragment.same_as(buffer)) {
+          return plan;
+        }
+      }
+    }
+    return Optional<PtoSlotPlan>();
   }
 
   // ------------------------------------------------------------------
@@ -1292,7 +1487,8 @@ private:
             : unit->loop_var;
     // The definition snapshot at the unit's lexical position.
     const Stmt &body_to_verify = inner != nullptr ? inner->body : unit->body;
-    UnitVisitor unit_visitor(this, vector_var, mapping, defs_);
+    UnitVisitor unit_visitor(this, vector_var, mapping, defs_,
+                             region_loop_ranges_);
     unit_visitor(body_to_verify);
   }
 
@@ -1348,7 +1544,16 @@ private:
       }
       std::set<const VarNode *> saved = defs_;
       defs_.insert(for_node->loop_var.get());
+      Map<Var, Range> saved_ranges = region_loop_ranges_;
+      const auto *wrap_min = for_node->min.as<IntImmNode>();
+      const auto *wrap_extent = for_node->extent.as<IntImmNode>();
+      if (wrap_min != nullptr && wrap_extent != nullptr) {
+        region_loop_ranges_.Set(
+            for_node->loop_var,
+            Range::FromMinExtent(for_node->min, for_node->extent));
+      }
       WalkRegion(for_node->body, units, lanes, next_unit);
+      region_loop_ranges_ = std::move(saved_ranges);
       defs_ = std::move(saved);
       return;
     }
@@ -1491,6 +1696,10 @@ private:
   // (blockIdx, outer/VF-internal binds) and leaked sibling-scope loop
   // vars into every unit.
   std::set<const VarNode *> defs_;
+  // Ranges of region-level serial loops currently wrapping the unit being
+  // verified (maintained by WalkRegion with save/restore). Handed to each
+  // UnitVisitor so the fragment entry-interval proof can bind them.
+  Map<Var, Range> region_loop_ranges_;
   // Data Vars of AllocBuffers annotated tirx.volatile (collected
   // function-wide by CollectVolatileAllocs; identity-matched at every
   // access inside a converting region).
